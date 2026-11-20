@@ -1,10 +1,12 @@
 //! Types related to task management
 use super::TaskContext;
-use crate::config::TRAP_CONTEXT_BASE;
+use crate::config::{MAX_SYSCALL_NUM, TRAP_CONTEXT_BASE};
 use crate::mm::{
     kernel_stack_position, MapPermission, MemorySet, PhysPageNum, VirtAddr, KERNEL_SPACE,
 };
 use crate::trap::{trap_handler, TrapContext};
+use alloc::vec;
+use alloc::vec::Vec;
 
 /// The task control block (TCB) of a task.
 pub struct TaskControlBlock {
@@ -28,6 +30,15 @@ pub struct TaskControlBlock {
 
     /// Program break
     pub program_brk: usize,
+
+    /// How many times each syscall id has been invoked by this task.
+    /// `syscall_counter[i]` counts the calls that are *about to* execute with
+    /// id `i`, so it already includes the call currently being handled. This
+    /// is what `sys_trace(TraceRequest::Syscall, id, _)` reports.
+    pub syscall_counter: Vec<usize>,
+
+    /// Virtual wake-up time (ms) of a `Sleeping` task; meaningless otherwise.
+    pub wake_ms: usize,
 }
 
 impl TaskControlBlock {
@@ -63,6 +74,8 @@ impl TaskControlBlock {
             base_size: user_sp,
             heap_bottom: user_sp,
             program_brk: user_sp,
+            syscall_counter: vec![0; MAX_SYSCALL_NUM],
+            wake_ms: 0,
         };
         // prepare TrapContext in user space
         let trap_cx = task_control_block.get_trap_cx();
@@ -109,4 +122,6 @@ pub enum TaskStatus {
     Running,
     /// exited
     Exited,
+    /// waiting for its virtual wake-up time; the scheduler must not pick it
+    Sleeping,
 }
