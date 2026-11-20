@@ -104,6 +104,22 @@ pub fn exit_current_and_run_next(exit_code: i32) {
     schedule(&mut _unused as *mut _);
 }
 
+/// Create a process from an easy-fs file (the only way a program image reaches memory in
+/// ch6+) and register it as a child of the current task. Used by `sys_spawn`; returns
+/// `None` when the name does not exist in the filesystem root.
+pub fn fork_and_exec_from_inode(path: &str) -> Option<usize> {
+    // `open_file` in RDONLY mode never touches the root directory, so spawning does not
+    // create or truncate anything. The image is read out of easy-fs before it is parsed.
+    let elf_data = open_file(path, OpenFlags::RDONLY)?.read_all();
+    let current = current_task()?;
+    let child = current.spawn(elf_data.as_slice());
+    let pid = child.getpid();
+    // ---- hold parent PCB lock while pushing the child into `children`
+    current.inner_exclusive_access().children.push(child.clone());
+    add_task(child);
+    Some(pid)
+}
+
 lazy_static! {
     /// Creation of initial process
     ///

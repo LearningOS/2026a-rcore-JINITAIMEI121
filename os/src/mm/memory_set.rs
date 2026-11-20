@@ -283,6 +283,75 @@ impl MemorySet {
     pub fn translate(&self, vpn: VirtPageNum) -> Option<PageTableEntry> {
         self.page_table.translate(vpn)
     }
+    /// Is `vpn` mapped in this address space? Used by `sys_mmap`/`sys_munmap` to check
+    /// that a region is free before mapping it and already present before unmapping it.
+    pub fn is_mapped(&self, vpn: VirtPageNum) -> bool {
+        matches!(self.translate(vpn), Some(pte) if pte.is_valid())
+    }
+    /// Whether every page of `[start_vpn, end_vpn)` is unmapped. `sys_mmap` refuses a
+    /// range that would drop a fresh page on top of one the process already owns: the old
+    /// mapping would stay reachable through no name at all.
+    pub fn is_range_free(&self, start_vpn: VirtPageNum, end_vpn: VirtPageNum) -> bool {
+        (start_vpn.0..end_vpn.0).all(|vpn| !self.is_mapped(VirtPageNum(vpn)))
+    }
+    /// Whether every page of `[start_vpn, end_vpn)` is mapped. `sys_munmap` uses it to
+    /// reject a range the process does not fully own.
+    pub fn is_range_mapped(&self, start_vpn: VirtPageNum, end_vpn: VirtPageNum) -> bool {
+        (start_vpn.0..end_vpn.0).all(|vpn| self.is_mapped(VirtPageNum(vpn)))
+    }
+    /// Unmap and drop every `MapArea` lying entirely inside `[start_vpn, end_vpn)`, then
+    /// cut out of the areas that *straddle* one of the range's two borders the pages the
+    /// caller asked for. A straddling area is split into the part below the range (which
+    /// stays) and the part above it (which also stays, as its own area); only the middle,
+    /// exactly `[start_vpn, end_vpn)`, goes away -- so `munmap(start, len)` after
+    /// `mmap(start, len)` + `mmap(start + len, 2 * len)` releases precisely the first page
+    /// and leaves the rest reachable through the mapping the caller still owns.
+    /// Returns whether at least one page was released; an empty request removes nothing.
+    pub fn remove_area_in_range(&mut self, start_vpn: VirtPageNum, end_vpn: VirtPageNum) -> bool {
+        if start_vpn.0 >= end_vpn.0 {
+            return false;
+        }
+        let mut removed = false;
+        let mut index = 0;
+        while index < self.areas.len() {
+            if self.areas[index].is_contained_in(start_vpn, end_vpn) {
+                // Dropping the area drops its FrameTrackers, which returns the physical
+                // pages to the allocator; the page table entries go away first.
+                let area = self.areas.remove(index);
+                for vpn in area.vpn_range {
+                    self.page_table.unmap(vpn);
+                }
+                drop(area);
+                removed = true;
+            } else {
+                index += 1;
+            }
+        }
+        // What is left can only overlap the range by sticking out over one of its borders.
+        // Release just the pages inside and keep the remainder(s).
+        let mut index = 0;
+        while index < self.areas.len() {
+            let area = &self.areas[index];
+            let straddles = area.vpn_range_start().0 < end_vpn.0
+                && start_vpn.0 < area.vpn_range_end().0;
+            if straddles {
+                let above =
+                    self.areas[index].remove_partial_range(&mut self.page_table, start_vpn, end_vpn);
+                removed = true;
+                match above {
+                    Some(upper) => {
+                        self.areas.insert(index + 1, upper);
+                        // The new area starts past the range, so it cannot straddle again.
+                        index += 2;
+                    }
+                    None => index += 1,
+                }
+            } else {
+                index += 1;
+            }
+        }
+        removed
+    }
 
     ///Remove all `MapArea`
     pub fn recycle_data_pages(&mut self) {
@@ -351,6 +420,80 @@ impl MapArea {
             map_perm: another.map_perm,
         }
     }
+    /// Is this area entirely inside `[start_vpn, end_vpn)`? An empty area (which is what
+    /// `MapArea::new` yields for a zero-length request) is trivially contained, so
+    /// `remove_area_in_range` can clean it up without ever touching a page table entry.
+    fn is_contained_in(&self, start_vpn: VirtPageNum, end_vpn: VirtPageNum) -> bool {
+        let l = self.vpn_range.get_start().0;
+        let r = self.vpn_range.get_end().0;
+        l >= start_vpn.0 && r <= end_vpn.0
+    }
+    /// The area's first virtual page number.
+    fn vpn_range_start(&self) -> VirtPageNum {
+        self.vpn_range.get_start()
+    }
+    /// The area's end (exclusive) virtual page number.
+    fn vpn_range_end(&self) -> VirtPageNum {
+        self.vpn_range.get_end()
+    }
+    /// Unmap the pages this area has in common with `[start_vpn, end_vpn)` and shrink the
+    /// area accordingly. Assumes the two ranges overlap but neither contains the other, so
+    /// exactly one border cuts through the area; the piece that survives on the far side of
+    /// the range is returned as a fresh area (`None` when nothing does).
+    ///
+    /// Splitting rather than refusing is what makes `munmap(start, len)` legal after two
+    /// adjacent `mmap`s merged into one area: the caller gives back the first page and the
+    /// second stays mapped under the mapping it was created with. Frames follow their page
+    /// table entries -- `unmap_one` forgets exactly the ones being released, so the new
+    /// area only has to take over the *range* of the pages that stay.
+    fn remove_partial_range(
+        &mut self,
+        page_table: &mut PageTable,
+        start_vpn: VirtPageNum,
+        end_vpn: VirtPageNum,
+    ) -> Option<MapArea> {
+        assert_eq!(
+            self.map_type,
+            MapType::Framed,
+            "a static area must never be unmapped"
+        );
+        let l = self.vpn_range.get_start();
+        let r = self.vpn_range.get_end();
+        if l.0 < start_vpn.0 && r.0 > end_vpn.0 {
+            // [ l .. start ) [ start .. end ) [ end .. r )  -- keep both sides
+            for vpn in VPNRange::new(start_vpn, end_vpn) {
+                self.unmap_one(page_table, vpn);
+            }
+            let upper = MapArea {
+                vpn_range: VPNRange::new(end_vpn, r),
+                data_frames: BTreeMap::new(),
+                map_type: self.map_type,
+                map_perm: self.map_perm,
+            };
+            self.vpn_range = VPNRange::new(l, start_vpn);
+            Some(upper)
+        } else if l.0 < start_vpn.0 {
+            // [ l .. start ) [ start .. r )  -- the range swallows the tail
+            for vpn in VPNRange::new(start_vpn, r) {
+                self.unmap_one(page_table, vpn);
+            }
+            self.vpn_range = VPNRange::new(l, start_vpn);
+            None
+        } else {
+            // [ l .. end ) [ end .. r )  -- the range swallows the head
+            for vpn in VPNRange::new(l, end_vpn) {
+                self.unmap_one(page_table, vpn);
+            }
+            let upper = MapArea {
+                vpn_range: VPNRange::new(end_vpn, r),
+                data_frames: BTreeMap::new(),
+                map_type: self.map_type,
+                map_perm: self.map_perm,
+            };
+            self.vpn_range = VPNRange::new(end_vpn, end_vpn);
+            Some(upper)
+        }
+    }
     pub fn map_one(&mut self, page_table: &mut PageTable, vpn: VirtPageNum) {
         let ppn: PhysPageNum;
         match self.map_type {
@@ -367,8 +510,13 @@ impl MapArea {
         page_table.map(vpn, ppn, pte_flags);
     }
     pub fn unmap_one(&mut self, page_table: &mut PageTable, vpn: VirtPageNum) {
+        #[allow(clippy::needless_branches)]
         if self.map_type == MapType::Framed {
+            // A framed area owns its frames; forget the tracker so the frame is released.
             self.data_frames.remove(&vpn);
+        } else {
+            // An identical (static) area must never be partially unmapped, and no frame
+            // belongs to it anyway -- nothing to forget.
         }
         page_table.unmap(vpn);
     }

@@ -11,6 +11,11 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::cell::RefMut;
 
+/// Default stride used by the scheduler when a process never calls `sys_set_priority`.
+/// It matches the tutorial's stride tests, where the "low priority" class is 16 and the
+/// "high priority" class is 1.
+pub const DEFAULT_STRIDE: usize = 16;
+
 /// Task control block structure
 ///
 /// Directly save the contents that will not change during running
@@ -71,6 +76,15 @@ pub struct TaskControlBlockInner {
 
     /// Program break
     pub program_brk: usize,
+
+    /// Virtual time accumulated by this process, in ticks of CPU. The stride scheduler
+    /// picks the task with the smallest `vtime` next, so a task that runs often drifts
+    /// ahead and gets overtaken -- which is what bounds its share of the CPU.
+    pub vtime: usize,
+
+    /// How much virtual time this process gains per unit of real time. Set by
+    /// `sys_set_priority`; 16 is the default used by the tutorial's stride tests.
+    pub stride: usize,
 }
 
 impl TaskControlBlockInner {
@@ -135,6 +149,8 @@ impl TaskControlBlock {
                     ],
                     heap_bottom: user_sp,
                     program_brk: user_sp,
+                    vtime: 0,
+                    stride: DEFAULT_STRIDE,
                 })
             },
         };
@@ -154,6 +170,15 @@ impl TaskControlBlock {
     pub fn exec(&self, elf_data: &[u8]) {
         // memory_set with elf program headers/trampoline/trap context/user stack
         let (memory_set, user_sp, entry_point) = MemorySet::from_elf(elf_data);
+        self.exec_with(memory_set, user_sp, entry_point);
+    }
+
+    /// Shared tail of `exec()` and `spawn()`: install a freshly built address space.
+    ///
+    /// The previous pages are released by replacing `memory_set` (each `MapArea` owns the
+    /// `FrameTracker`s of its frames), so frames created by `mmap` are reclaimed when the
+    /// program image is replaced.
+    fn exec_with(&self, memory_set: MemorySet, user_sp: usize, entry_point: usize) {
         let trap_cx_ppn = memory_set
             .translate(VirtAddr::from(TRAP_CONTEXT_BASE).into())
             .unwrap()
@@ -165,6 +190,20 @@ impl TaskControlBlock {
         inner.memory_set = memory_set;
         // update trap_cx ppn
         inner.trap_cx_ppn = trap_cx_ppn;
+        // the fresh image brings its own heap bottom / program break
+        inner.heap_bottom = user_sp;
+        inner.program_brk = user_sp;
+        // A brand new program must not keep the previous one's files open: stdin/stdout
+        // are re-installed, everything else is dropped. (This is also what keeps an
+        // `exec`-ed image's file offset at 0 for ch6b_cat.)
+        inner.fd_table = vec![
+            // 0 -> stdin
+            Some(Arc::new(Stdin)),
+            // 1 -> stdout
+            Some(Arc::new(Stdout)),
+            // 2 -> stderr
+            Some(Arc::new(Stdout)),
+        ];
         // initialize trap_cx
         let trap_cx = TrapContext::app_init_context(
             entry_point,
@@ -216,6 +255,10 @@ impl TaskControlBlock {
                     fd_table: new_fd_table,
                     heap_bottom: parent_inner.heap_bottom,
                     program_brk: parent_inner.program_brk,
+                    // a child inherits its parent's virtual time and stride: fork must not
+                    // hand out free CPU time nor silently change the scheduling class
+                    vtime: parent_inner.vtime,
+                    stride: parent_inner.stride,
                 })
             },
         });
@@ -260,6 +303,60 @@ impl TaskControlBlock {
         } else {
             None
         }
+    }
+
+    /// Create a brand new process running `elf_data`, as an independent child of `self`.
+    ///
+    /// Unlike `fork()`, nothing is copied from the parent's address space: the child gets
+    /// a fresh image (so a fresh heap bottom/program break and no leftover mmap pages)
+    /// and a fresh fd table. The parent still records it in `children`, which is what lets
+    /// `waitpid(pid_of_spawn, ...)` reap it -- the part `fork()+exec()` cannot provide.
+    pub fn spawn(self: &Arc<TaskControlBlock>, elf_data: &[u8]) -> Arc<TaskControlBlock> {
+        let (memory_set, user_sp, entry_point) = MemorySet::from_elf(elf_data);
+        let trap_cx_ppn = memory_set
+            .translate(VirtAddr::from(TRAP_CONTEXT_BASE).into())
+            .unwrap()
+            .ppn();
+        let pid_handle = pid_alloc();
+        let kernel_stack = kstack_alloc();
+        let kernel_stack_top = kernel_stack.get_top();
+        let task_control_block = Arc::new(TaskControlBlock {
+            pid: pid_handle,
+            kernel_stack,
+            inner: unsafe {
+                UPSafeCell::new(TaskControlBlockInner {
+                    trap_cx_ppn,
+                    base_size: user_sp,
+                    task_cx: TaskContext::goto_trap_return(kernel_stack_top),
+                    task_status: TaskStatus::Ready,
+                    memory_set,
+                    parent: Some(Arc::downgrade(self)),
+                    children: Vec::new(),
+                    exit_code: 0,
+                    fd_table: vec![
+                        Some(Arc::new(Stdin)),
+                        Some(Arc::new(Stdout)),
+                        Some(Arc::new(Stdout)),
+                    ],
+                    heap_bottom: user_sp,
+                    program_brk: user_sp,
+                    // a spawned process starts its own virtual time account; giving it the
+                    // parent's vtime would push it to the back of the stride queue for no
+                    // reason, since it has not consumed any CPU yet
+                    vtime: 0,
+                    stride: DEFAULT_STRIDE,
+                })
+            },
+        });
+        let trap_cx = task_control_block.inner_exclusive_access().get_trap_cx();
+        *trap_cx = TrapContext::app_init_context(
+            entry_point,
+            user_sp,
+            KERNEL_SPACE.exclusive_access().token(),
+            kernel_stack_top,
+            trap_handler as usize,
+        );
+        task_control_block
     }
 }
 

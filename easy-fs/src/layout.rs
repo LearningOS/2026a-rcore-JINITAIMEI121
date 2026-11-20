@@ -9,8 +9,10 @@ const EFS_MAGIC: u32 = 0x3b800001;
 const INODE_DIRECT_COUNT: usize = 28;
 /// The max length of inode name
 const NAME_LENGTH_LIMIT: usize = 27;
+/// Number of `u32` slots in a block
+const SLOTS_PER_BLOCK: usize = BLOCK_SZ / 4;
 /// The max number of indirect1 inodes
-const INODE_INDIRECT1_COUNT: usize = BLOCK_SZ / 4;
+const INODE_INDIRECT1_COUNT: usize = SLOTS_PER_BLOCK;
 /// The max number of indirect2 inodes
 const INODE_INDIRECT2_COUNT: usize = INODE_INDIRECT1_COUNT * INODE_INDIRECT1_COUNT;
 /// The upper bound of direct inode index
@@ -67,11 +69,20 @@ impl SuperBlock {
         self.magic == EFS_MAGIC
     }
 }
-/// Type of a disk inode
-#[derive(PartialEq)]
+/// Type of a disk inode.
+///
+/// Stored in the 4 bytes at offset 124 of a `DiskInode`, i.e. exactly where the tutorial
+/// puts its untyped `type_` field; `#[repr(u32)]` only pins the width so the guaranteed
+/// 128-byte size below cannot silently drift. The word holds *only* the type: the hard
+/// link count is derived from the directory entries that name the inode, because packing
+/// a count in here would collide with `Directory == 1` and turn a file into a directory.
+#[derive(Copy, Clone, PartialEq, Debug)]
+#[repr(u32)]
 pub enum DiskInodeType {
-    File,
-    Directory,
+    /// regular file
+    File = 0,
+    /// directory
+    Directory = 1,
 }
 
 /// A indirect block
@@ -79,6 +90,20 @@ type IndirectBlock = [u32; BLOCK_SZ / 4];
 /// A data block
 type DataBlock = [u8; BLOCK_SZ];
 /// A disk inode
+///
+/// On-disk layout (128 bytes), byte-compatible with the tutorial's `DiskInode`:
+///
+/// ```text
+/// offset   0 : size       (u32)
+/// offset   4 : direct[28] (u32 * 28)
+/// offset 116 : indirect1  (u32)
+/// offset 120 : indirect2  (u32)
+/// offset 124 : type_      (DiskInodeType, repr(u32))
+/// ```
+///
+/// The last field is the inode type only. `fstat` derives the hard link count by counting
+/// the directory entries that name the inode, so nothing in this word has to be maintained
+/// when a name is added or removed.
 #[repr(C)]
 pub struct DiskInode {
     pub size: u32,
@@ -87,6 +112,20 @@ pub struct DiskInode {
     pub indirect2: u32,
     type_: DiskInodeType,
 }
+
+/// Compile-time proof that the struct really has the layout documented above.
+const _: () = {
+    assert!(core::mem::size_of::<DiskInode>() == 128);
+    assert!(core::mem::offset_of!(DiskInode, size) == 0);
+    assert!(core::mem::offset_of!(DiskInode, direct) == 4);
+    assert!(core::mem::offset_of!(DiskInode, indirect1) == 116);
+    assert!(core::mem::offset_of!(DiskInode, indirect2) == 120);
+    assert!(core::mem::offset_of!(DiskInode, type_) == 124);
+};
+
+/// Size of a `DiskInode` on disk. Exported so other modules can invert
+/// `EasyFileSystem::get_disk_inode_pos` without repeating the layout assertions.
+pub const DISK_INODE_SZ: usize = core::mem::size_of::<DiskInode>();
 
 impl DiskInode {
     /// Initialize a disk inode, as well as all direct inodes under it
@@ -111,8 +150,94 @@ impl DiskInode {
     pub fn data_blocks(&self) -> u32 {
         Self::_data_blocks(self.size)
     }
-    fn _data_blocks(size: u32) -> u32 {
+    pub(crate) fn _data_blocks(size: u32) -> u32 {
         (size + BLOCK_SZ as u32 - 1) / BLOCK_SZ as u32
+    }
+    /// Clear the pointer to data block `inner_id` and return the ids that leave the
+    /// inode with it: the data block itself, plus an indirect table that only existed to
+    /// reach it.
+    ///
+    /// The pointers are zeroed as we go, so a freed block can never be handed out twice --
+    /// a later `clear_size()` only walks pointers that are still set. This is what an
+    /// unlink needs: a directory loses one 32-byte dirent at a time, which pops a data
+    /// block whenever the entry count crosses a block boundary.
+    fn clear_data_block(
+        &mut self,
+        inner_id: u32,
+        block_device: &Arc<dyn BlockDevice>,
+    ) -> Vec<u32> {
+        let mut freed = Vec::new();
+        let inner_id = inner_id as usize;
+        if inner_id < INODE_DIRECT_COUNT {
+            freed.push(self.direct[inner_id]);
+            self.direct[inner_id] = 0;
+            // The indirect1 table exists only because of data beyond the direct slots, so
+            // dropping the last direct data block drops its table too.
+            if inner_id == INODE_DIRECT_COUNT - 1 && self.indirect1 != 0 {
+                freed.push(self.indirect1);
+                self.indirect1 = 0;
+            }
+        } else if inner_id < INDIRECT1_BOUND {
+            let slot = inner_id - INODE_DIRECT_COUNT;
+            freed.push(
+                get_block_cache(self.indirect1 as usize, Arc::clone(block_device))
+                    .lock()
+                    .modify(0, |indirect_block: &mut IndirectBlock| {
+                        let id = indirect_block[slot];
+                        indirect_block[slot] = 0;
+                        id
+                    }),
+            );
+            // emptying the indirect1 table from its first entry releases the table itself
+            if slot == 0 {
+                freed.push(self.indirect1);
+                self.indirect1 = 0;
+            }
+        } else {
+            let last = inner_id - INDIRECT1_BOUND;
+            let slot = last % INODE_INDIRECT1_COUNT;
+            let row = last / INODE_INDIRECT1_COUNT;
+            let indirect1 = get_block_cache(self.indirect2 as usize, Arc::clone(block_device))
+                .lock()
+                .read(0, |indirect2: &IndirectBlock| indirect2[row]);
+            freed.push(
+                get_block_cache(indirect1 as usize, Arc::clone(block_device))
+                    .lock()
+                    .modify(0, |table: &mut IndirectBlock| {
+                        let id = table[slot];
+                        table[slot] = 0;
+                        id
+                    }),
+            );
+            // an emptied indirect1 row goes back as well, together with the indirect2
+            // table when the row was the first one
+            if slot == 0 {
+                freed.push(indirect1);
+                if row == 0 {
+                    freed.push(self.indirect2);
+                    self.indirect2 = 0;
+                }
+            }
+        }
+        freed
+    }
+    /// Shrink the inode to `new_size` and return every block that leaves its range,
+    /// including the indirect tables that become unreachable.
+    pub fn decrease_size(
+        &mut self,
+        new_size: u32,
+        block_device: &Arc<dyn BlockDevice>,
+    ) -> Vec<u32> {
+        assert!(new_size <= self.size);
+        let old_data_blocks = Self::_data_blocks(self.size) as usize;
+        let new_data_blocks = Self::_data_blocks(new_size) as usize;
+        let mut freed = Vec::new();
+        // walk downwards so that each pointer we clear is still the one that was live
+        for inner_id in (new_data_blocks..old_data_blocks).rev() {
+            freed.extend(self.clear_data_block(inner_id as u32, block_device));
+        }
+        self.size = new_size;
+        freed
     }
     /// Return number of blocks needed include indirect1/2.
     pub fn total_blocks(size: u32) -> u32 {
@@ -422,13 +547,32 @@ impl DirEntry {
     pub fn as_bytes_mut(&mut self) -> &mut [u8] {
         unsafe { core::slice::from_raw_parts_mut(self as *mut _ as usize as *mut u8, DIRENT_SZ) }
     }
-    /// Get name of the entry
+    /// Get name of the entry.
+    ///
+    /// The stored field is `NAME_LENGTH_LIMIT + 1` bytes and holds a NUL-terminated string,
+    /// so the scan stops at the terminator for every sane entry. It must not run off the
+    /// end when a slot was never written: the directory is scanned by every
+    /// `find`/`create`/`unlink`, and an out-of-bounds read there would take the kernel down
+    /// while it is only looking up a file name.
     pub fn name(&self) -> &str {
-        let len = (0usize..).find(|i| self.name[*i] == 0).unwrap();
-        core::str::from_utf8(&self.name[..len]).unwrap()
+        let len = (0..self.name.len())
+            .find(|i| self.name[*i] == 0)
+            .unwrap_or(self.name.len());
+        core::str::from_utf8(&self.name[..len]).unwrap_or("")
     }
     /// Get inode number of the entry
     pub fn inode_id(&self) -> u32 {
         self.inode_id
+    }
+    /// Is this a directory entry that names a file?
+    ///
+    /// The tutorial stores dirents densely and keeps the directory size at a whole number
+    /// of entries, so a slot inside `[0, size / DIRENT_SZ)` is only ever written by
+    /// `create()`/`link()`. A freshly formatted (or zeroed) block has `name[0] == 0`, which
+    /// `name()` reports as the empty string -- no name can be created for it, because
+    /// `DirEntry::new("", ..)` would be indistinguishable from an unused slot. Skipping such
+    /// slots therefore costs nothing and keeps every scan from treating padding as a file.
+    pub fn is_used(&self) -> bool {
+        self.name[0] != 0
     }
 }

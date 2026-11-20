@@ -175,6 +175,12 @@ impl VirtPageNum {
         }
         idx
     }
+    /// The next page number, without mutating `self`.
+    pub fn next(self) -> Self {
+        let mut v = self;
+        v.step();
+        v
+    }
 }
 
 impl PhysAddr {

@@ -53,9 +53,66 @@ impl OSInode {
         }
         v
     }
+    /// The inode number of this open file. It is a property of the underlying disk
+    /// inode, so it stays valid even after every directory entry that named it has been
+    /// unlinked -- exactly what `fstat` needs to report while a deleted-but-open file is
+    /// still being written to.
+    pub fn ino(&self) -> u32 {
+        self.inner.exclusive_access().inode.id()
+    }
+    /// Whether this open file is a directory. The kernel never creates one, but `fstat`
+    /// must not report a directory as a regular file if the image ever contains one.
+    pub fn is_dir(&self) -> bool {
+        self.inner.exclusive_access().inode.is_dir()
+    }
+    /// Length of the file in bytes, taken from the disk inode rather than from a name
+    /// lookup, so it stays meaningful once every dirent for the file is gone.
+    pub fn size(&self) -> usize {
+        self.inner.exclusive_access().inode.size()
+    }
+    /// Snapshot of the whole file content. Only used by `sys_unlinkat`, which needs to
+    /// tell an already-detached (and possibly re-used) inode number apart from the live
+    /// dirent of the same name before it destroys data.
+    pub fn read_all_content(&self) -> Vec<u8> {
+        self.inner.exclusive_access().inode.read_all()
+    }
+    /// How many blocks (data + indirect tables) the underlying disk inode owns. A file
+    /// that was already unlinked and truncated reads 0, which is what lets `sys_unlinkat`
+    /// refuse to unlink a name that no longer refers to the descriptor's inode.
+    pub fn block_count(&self) -> usize {
+        self.inner.exclusive_access().inode.block_count()
+    }
+}
+
+/// The last reference to an open file owns its data blocks. easy-fs has no on-disk link
+/// count and no in-memory inode refcount, so this `Arc` *is* the reference: when a file
+/// was unlinked while still open, closing it here is the first (and only) safe point to
+/// release the blocks. Releasing them during the unlink itself would be wrong twice over
+/// -- other descriptors would keep writing into freed blocks, and because inode ids come
+/// from a bitmap the id could already have been re-used by a different live file.
+impl Drop for OSInode {
+    fn drop(&mut self) {
+        // Only a writable handle may change anything on disk; read-only descriptors never
+        // truncate. `blocks != 0` short-circuits the common case without touching the
+        // allocator, so this stays cheap for stdin/stdout-style objects.
+        if !self.writable {
+            return;
+        }
+        let (id, blocks) = {
+            let inner = self.inner.exclusive_access();
+            (inner.inode.id(), inner.inode.block_count())
+        };
+        if blocks != 0 && ROOT_INODE.count_dirents_to(id) == 0 {
+            // The borrow above is gone, so the filesystem lock can be taken again.
+            let inner = self.inner.exclusive_access();
+            inner.inode.free_blocks();
+        }
+    }
 }
 
 lazy_static! {
+    /// The root directory of the easy-fs volume, opened once at boot. It is the handle
+    /// every path-based syscall (`find`/`create`/`link`/`remove_dirent`) goes through.
     pub static ref ROOT_INODE: Arc<Inode> = {
         let efs = EasyFileSystem::open(BLOCK_DEVICE.clone());
         Arc::new(EasyFileSystem::root_inode(&efs))
@@ -126,6 +183,9 @@ pub fn open_file(name: &str, flags: OpenFlags) -> Option<Arc<OSInode>> {
 }
 
 impl File for OSInode {
+    fn as_any(&self) -> &(dyn core::any::Any + Send + Sync) {
+        self
+    }
     fn readable(&self) -> bool {
         self.readable
     }

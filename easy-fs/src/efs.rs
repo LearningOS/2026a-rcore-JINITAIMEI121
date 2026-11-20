@@ -125,6 +125,21 @@ impl EasyFileSystem {
     pub fn get_data_block_id(&self, data_block_id: u32) -> u32 {
         self.data_area_start_block + data_block_id
     }
+    /// First block of the inode area. Inverse helper for `Inode::id()`.
+    pub fn inode_area_start_block(&self) -> u32 {
+        self.inode_area_start_block
+    }
+    /// Mark an inode as free again so that `alloc_inode()` can hand it out later.
+    ///
+    /// Used when the last hard link to a file disappears. The bit index is relative to
+    /// the start of the inode area, mirroring `get_disk_inode_pos`.
+    pub fn dealloc_inode(&mut self, inode_id: u32) {
+        let inodes_per_block = (BLOCK_SZ / core::mem::size_of::<DiskInode>()) as u32;
+        self.inode_bitmap.dealloc(
+            &self.block_device,
+            (inode_id - self.inode_area_start_block * inodes_per_block) as usize,
+        )
+    }
     /// Allocate a new inode
     pub fn alloc_inode(&mut self) -> u32 {
         self.inode_bitmap.alloc(&self.block_device).unwrap() as u32
