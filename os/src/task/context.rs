@@ -13,13 +13,12 @@ pub struct TaskContext {
 }
 
 impl TaskContext {
+    /// Default stride of a freshly created task, i.e. the stride it is served
+    /// with when it never changed its priority
+    pub const DEFAULT_STRIDE: usize = 1 << 20;
     /// Create a new empty task context
     pub fn zero_init() -> Self {
-        Self {
-            ra: 0,
-            sp: 0,
-            s: [0; 12],
-        }
+        Self { ra: 0, sp: 0, s: [0; 12] }
     }
     /// Create a new task context with a trap return addr and a kernel stack pointer
     pub fn goto_trap_return(kstack_ptr: usize) -> Self {

@@ -60,6 +60,13 @@ pub fn get_app_data_by_name(name: &str) -> Option<&'static [u8]> {
         .find(|&i| APP_NAMES[i] == name)
         .map(get_app_data)
 }
+/// Get the elf image of an application by name.
+///
+/// A trailing `\0` is tolerated so that callers may pass either a plain name
+/// (`"ch5_getpid"`) or a C style string (`"ch5_getpid\0"`).
+pub fn find_app_data_by_name(name: &str) -> Option<&'static [u8]> {
+    get_app_data_by_name(name.strip_suffix('\0').unwrap_or(name))
+}
 ///list all apps
 pub fn list_apps() {
     println!("/**** APPS ****");

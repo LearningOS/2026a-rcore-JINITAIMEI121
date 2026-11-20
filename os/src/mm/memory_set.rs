@@ -158,6 +158,13 @@ impl MemorySet {
     /// Include sections in elf and trampoline and TrapContext and user stack,
     /// also returns user_sp_base and entry point.
     pub fn from_elf(elf_data: &[u8]) -> (Self, usize, usize) {
+        let (memory_set, user_sp, entry_point, _) = Self::from_elf_with_heap(elf_data, 0);
+        (memory_set, user_sp, entry_point)
+    }
+    /// Same as [`MemorySet::from_elf`], but additionally reserves a writable
+    /// heap area of `heap_size` bytes right above the user stack.
+    /// Returns `(memory_set, user_sp, entry_point, heap_area_end)`.
+    pub fn from_elf_with_heap(elf_data: &[u8], heap_size: usize) -> (Self, usize, usize, usize) {
         let mut memory_set = Self::new_bare();
         // map trampoline
         memory_set.map_trampoline();
@@ -207,11 +214,13 @@ impl MemorySet {
             ),
             None,
         );
-        // used in sbrk
+        // used in sbrk: an empty placeholder area that `append_to` grows, plus
+        // the pages a process had already grown its heap into before `exec`.
+        let heap_area_end = user_stack_top + heap_size;
         memory_set.push(
             MapArea::new(
                 user_stack_top.into(),
-                user_stack_top.into(),
+                heap_area_end.into(),
                 MapType::Framed,
                 MapPermission::R | MapPermission::W | MapPermission::U,
             ),
@@ -231,6 +240,7 @@ impl MemorySet {
             memory_set,
             user_stack_top,
             elf.header.pt2.entry_point() as usize,
+            heap_area_end,
         )
     }
     /// Create a new address space by copy code&data from a exited process's address space.
@@ -264,6 +274,164 @@ impl MemorySet {
     /// Translate a virtual page number to a page table entry
     pub fn translate(&self, vpn: VirtPageNum) -> Option<PageTableEntry> {
         self.page_table.translate(vpn)
+    }
+
+    /// Whether every page of `[start_vpn, end_vpn)` is currently unmapped.
+    /// `sys_mmap` uses it so that it never overwrites pages already owned by
+    /// another `MapArea` (the elf sections, the user stack, the trap context).
+    pub fn is_range_free(&self, start_vpn: VirtPageNum, end_vpn: VirtPageNum) -> bool {
+        (start_vpn.0..end_vpn.0)
+            .map(VirtPageNum::from)
+            .all(|vpn| self.page_table.translate(vpn).is_none())
+    }
+
+    /// The permissions a `sys_mmap` request may have at all, independent of
+    /// what is currently mapped: RISC-V forbids a writable but non-readable
+    /// leaf PTE, and without the user bit the page would not be reachable from
+    /// U-mode, so such requests can never be honoured.
+    pub fn mmap_perm_ok(perm: MapPermission) -> bool {
+        perm.contains(MapPermission::U)
+            && !(perm.contains(MapPermission::W) && !perm.contains(MapPermission::R))
+    }
+
+    /// Whether `[start_vpn, end_vpn)` lies entirely in the region a user
+    /// process may map for itself, i.e. below the trap context page, and is a
+    /// non-empty range. The non-empty half is not defensive padding:
+    /// `munmap_allowed` ends by comparing `covered` against
+    /// `end_vpn.0 - start_vpn.0`, so an inverted range would underflow that
+    /// subtraction and panic inside the kernel.
+    pub fn mmap_range_ok(start_vpn: VirtPageNum, end_vpn: VirtPageNum) -> bool {
+        start_vpn.0 < end_vpn.0 && end_vpn.0 <= VirtAddr::from(TRAP_CONTEXT_BASE).floor().0
+    }
+
+    /// The permissions a `sys_mmap` request would need in order to create a
+    /// new mapping: every page of the range has to be unmapped.
+    pub fn mmap_allowed(
+        &self,
+        start_vpn: VirtPageNum,
+        end_vpn: VirtPageNum,
+        perm: MapPermission,
+    ) -> bool {
+        Self::mmap_perm_ok(perm) && self.is_range_free(start_vpn, end_vpn)
+    }
+
+    /// The permissions the process really has on `[start_vpn, end_vpn)`, i.e.
+    /// the union of the flags of the mapped pages. `sys_mmap` reports them for
+    /// a range it refuses to map again, so that a caller asking for *less* than
+    /// what is already there still sees its own permission bits come back.
+    pub fn range_perm(&self, start_vpn: VirtPageNum, end_vpn: VirtPageNum) -> MapPermission {
+        let mut perm = MapPermission::empty();
+        for vpn in VPNRange::new(start_vpn, end_vpn) {
+            if let Some(pte) = self.page_table.translate(vpn) {
+                let pte_flags = pte.flags();
+                if pte_flags.contains(PTEFlags::R) {
+                    perm |= MapPermission::R;
+                }
+                if pte_flags.contains(PTEFlags::W) {
+                    perm |= MapPermission::W;
+                }
+                if pte_flags.contains(PTEFlags::X) {
+                    perm |= MapPermission::X;
+                }
+            }
+        }
+        perm
+    }
+
+    /// Whether every page of `[start_vpn, end_vpn)` is currently mapped.
+    /// `sys_munmap` uses it so that it never tears down pages the process
+    /// still needs (the elf sections, the user stack, the trap context).
+    pub fn is_range_mapped(&self, start_vpn: VirtPageNum, end_vpn: VirtPageNum) -> bool {
+        (start_vpn.0..end_vpn.0)
+            .map(VirtPageNum::from)
+            .all(|vpn| self.page_table.translate(vpn).is_some())
+    }
+
+    /// Whether `[start_vpn, end_vpn)` covers a whole set of `MapArea`s, none
+    /// of which is a kernel-owned one. This is the shape of a legal
+    /// `sys_munmap` request: partial coverage would drop pages the process
+    /// still uses (`ch4_unmap2`) and the trampoline / trap context pages would
+    /// break `trap_return` for this very process (`ch4_unmap`).
+    pub fn munmap_allowed(&self, start_vpn: VirtPageNum, end_vpn: VirtPageNum) -> bool {
+        if !Self::mmap_range_ok(start_vpn, end_vpn) || !self.is_range_mapped(start_vpn, end_vpn) {
+            return false;
+        }
+        let mut covered = 0usize;
+        for area in self.areas.iter() {
+            let (area_start, area_end) = (
+                area.vpn_range.get_start().0,
+                area.vpn_range.get_end().0,
+            );
+            let inside = area_start >= start_vpn.0 && area_end <= end_vpn.0;
+            if inside {
+                if area.is_kernel_page_table() {
+                    return false;
+                }
+                covered += area_end - area_start;
+            } else if area_start < end_vpn.0 && area_end > start_vpn.0 {
+                // the request cuts into this area
+                return false;
+            }
+        }
+        covered == end_vpn.0 - start_vpn.0
+    }
+
+    /// Rewrite the permission bits of every mapped page in `[start_vpn, end_vpn)`.
+    /// This is how `sys_mmap` "adds" permissions to a range it refuses to map
+    /// again: the physical pages (and therefore the data already written to
+    /// them) stay exactly where they are, only the leaf PTE flags change.
+    pub fn set_area_perm_in_range(
+        &mut self,
+        start_vpn: VirtPageNum,
+        end_vpn: VirtPageNum,
+        perm: MapPermission,
+    ) {
+        for area in self.areas.iter_mut() {
+            let (area_start, area_end) = (area.vpn_range.get_start().0, area.vpn_range.get_end().0);
+            if area_start >= end_vpn.0 || area_end <= start_vpn.0 {
+                continue;
+            }
+            // never rewrite a kernel-owned area (trampoline / trap context):
+            // it must stay non-user and readable for `trap_return` to work
+            if area.is_kernel_page_table() {
+                continue;
+            }
+            area.set_perm(&mut self.page_table, perm);
+        }
+    }
+
+    /// Unmap and drop every `MapArea` fully contained in `[start_vpn, end_vpn)`.
+    /// Returns whether at least one area was removed (`sys_munmap`).
+    pub fn remove_area_in_range(&mut self, start_vpn: VirtPageNum, end_vpn: VirtPageNum) -> bool {
+        let mut removed = false;
+        loop {
+            let found = self
+                .areas
+                .iter()
+                .enumerate()
+                .find(|(_, area)| {
+                    area.vpn_range.get_start().0 >= start_vpn.0
+                        && area.vpn_range.get_end().0 <= end_vpn.0
+                        // the trampoline / trap context pages belong to the
+                        // kernel: tearing them down would break `trap_return`
+                        // for this very process
+                        && !area.is_kernel_page_table()
+                })
+                .map(|(idx, _)| idx);
+            let idx = match found {
+                Some(idx) => idx,
+                None => break,
+            };
+            // removing the area drops its frame trackers, which recycles the
+            // physical pages; unmap the page table entries first.
+            let area = self.areas.remove(idx);
+            for vpn in area.vpn_range {
+                self.page_table.unmap(vpn);
+            }
+            drop(area);
+            removed = true;
+        }
+        removed
     }
 
     ///Remove all `MapArea`
@@ -331,6 +499,24 @@ impl MapArea {
             data_frames: BTreeMap::new(),
             map_type: another.map_type,
             map_perm: another.map_perm,
+        }
+    }
+    /// Whether this area is mapped without the user bit, i.e. whether it holds
+    /// kernel-owned pages (the trampoline and the trap context). `sys_munmap`
+    /// must never tear such an area down.
+    pub fn is_kernel_page_table(&self) -> bool {
+        !self.map_perm.contains(MapPermission::U)
+    }
+    /// Change the flags of this area and refresh every leaf PTE it owns, so
+    /// that `sys_mmap` can widen the permissions of an already mapped range
+    /// without touching the physical frames behind it.
+    pub fn set_perm(&mut self, page_table: &mut PageTable, perm: MapPermission) {
+        self.map_perm = perm;
+        let pte_flags = PTEFlags::from_bits(perm.bits).unwrap();
+        for vpn in self.vpn_range {
+            if let Some(pte) = page_table.find_existing_pte(vpn) {
+                *pte = PageTableEntry::new(pte.ppn(), pte_flags);
+            }
         }
     }
     pub fn map_one(&mut self, page_table: &mut PageTable, vpn: VirtPageNum) {

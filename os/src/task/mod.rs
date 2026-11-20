@@ -24,13 +24,12 @@ mod task;
 use crate::loader::get_app_data_by_name;
 use alloc::sync::Arc;
 use lazy_static::*;
-pub use manager::{fetch_task, TaskManager};
+pub use manager::{add_task, fetch_task, wakeup_sleeping_tasks, TaskManager};
 use switch::__switch;
 pub use task::{TaskControlBlock, TaskStatus};
 
 pub use context::TaskContext;
 pub use id::{kstack_alloc, pid_alloc, KernelStack, PidHandle};
-pub use manager::add_task;
 pub use processor::{
     current_task, current_trap_cx, current_user_token, run_tasks, schedule, take_current_task,
     Processor,
@@ -40,16 +39,27 @@ pub fn suspend_current_and_run_next() {
     // There must be an application running.
     let task = take_current_task().unwrap();
 
+    // The stride of a task is charged exactly once, when it is fetched from
+    // the ready queue (see `TaskManager::fetch`), so a task that merely gives
+    // up the time slice must not be charged again here.
+
     // ---- access current TCB exclusively
     let mut task_inner = task.inner_exclusive_access();
     let task_cx_ptr = &mut task_inner.task_cx as *mut TaskContext;
-    // Change status to Ready
-    task_inner.task_status = TaskStatus::Ready;
+    // A sleeping task keeps its `Sleeping` status and stays out of the ready
+    // queue, so the clock really advances while it waits for `sys_sleep`.
+    let sleeping = task_inner.is_sleeping();
+    if !sleeping {
+        // Change status to Ready
+        task_inner.task_status = TaskStatus::Ready;
+    }
     drop(task_inner);
     // ---- release current PCB
 
-    // push back to ready queue.
-    add_task(task);
+    if !sleeping {
+        // push back to ready queue.
+        add_task(task);
+    }
     // jump to scheduling cycle
     schedule(task_cx_ptr);
 }

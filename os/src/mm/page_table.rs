@@ -1,5 +1,8 @@
 //! Implementation of [`PageTableEntry`] and [`PageTable`].
-use super::{frame_alloc, FrameTracker, PhysAddr, PhysPageNum, StepByOne, VirtAddr, VirtPageNum};
+use super::{
+    frame_alloc, FrameTracker, PhysAddr, PhysPageNum, StepByOne, VirtAddr, VirtPageNum,
+};
+use crate::config::PAGE_SIZE;
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
@@ -8,13 +11,21 @@ use bitflags::*;
 bitflags! {
     /// page table entry flags
     pub struct PTEFlags: u8 {
+        /// Valid
         const V = 1 << 0;
+        /// Readable
         const R = 1 << 1;
+        /// Writable
         const W = 1 << 2;
+        /// eXecutable
         const X = 1 << 3;
+        /// User
         const U = 1 << 4;
+        /// Global
         const G = 1 << 5;
+        /// Accessed
         const A = 1 << 6;
+        /// Dirty
         const D = 1 << 7;
     }
 }
@@ -143,6 +154,24 @@ impl PageTable {
     pub fn translate(&self, vpn: VirtPageNum) -> Option<PageTableEntry> {
         self.find_pte(vpn).map(|pte| *pte)
     }
+    /// The leaf page table entry of an already mapped page, `None` when any
+    /// level of the walk is missing. Used to rewrite the flags of an existing
+    /// mapping without allocating anything (`sys_mmap` widening permissions).
+    pub fn find_existing_pte(&mut self, vpn: VirtPageNum) -> Option<&mut PageTableEntry> {
+        let idxs = vpn.indexes();
+        let mut ppn = self.root_ppn;
+        for (i, idx) in idxs.iter().enumerate() {
+            let pte = &mut ppn.get_pte_array()[*idx];
+            if i == 2 {
+                return if pte.is_valid() { Some(pte) } else { None };
+            }
+            if !pte.is_valid() {
+                return None;
+            }
+            ppn = pte.ppn();
+        }
+        None
+    }
     /// get the physical address from the virtual address
     pub fn translate_va(&self, va: VirtAddr) -> Option<PhysAddr> {
         self.find_pte(va.clone().floor()).map(|pte| {
@@ -183,24 +212,27 @@ pub fn translated_byte_buffer(token: usize, ptr: *const u8, len: usize) -> Vec<&
     v
 }
 
-/// Translate&Copy a ptr[u8] array end with `\0` to a `String` Vec through page table
-pub fn translated_str(token: usize, ptr: *const u8) -> String {
-    let page_table = PageTable::from_token(token);
-    let mut string = String::new();
-    let mut va = ptr as usize;
-    loop {
-        let ch: u8 = *(page_table
-            .translate_va(VirtAddr::from(va))
-            .unwrap()
-            .get_mut());
-        if ch == 0 {
-            break;
-        } else {
-            string.push(ch as char);
-            va += 1;
-        }
+/// Translate&Copy a `\0` terminated string from user space into an owned
+/// `String`, copying at most up to the end of the page it starts on.
+///
+/// Returns `None` (instead of panicking) when the pointer is unmapped or runs
+/// past the SV39 address space, so that a user program can pass a bogus
+/// pointer and simply get `-1` back instead of crashing the kernel.
+pub fn translated_str(token: usize, ptr: *const u8) -> Option<String> {
+    const VA_LIMIT: usize = 1usize << 39;
+    if ptr.is_null() {
+        return None;
     }
-    string
+    let start = ptr as usize;
+    if start >= VA_LIMIT {
+        return None;
+    }
+    // Copy at most up to the end of the starting page, then look for the
+    // terminator; this never walks into an unmapped neighbouring page.
+    let max_len = PAGE_SIZE - (start % PAGE_SIZE);
+    let buffers = copied_byte_buffer(token, ptr, max_len)?;
+    let end = buffers.iter().position(|&ch| ch == 0)?;
+    String::from_utf8(buffers[..end].to_vec()).ok()
 }
 /// Translate a ptr[u8] array through page table and return a mutable reference of T
 pub fn translated_refmut<T>(token: usize, ptr: *mut T) -> &'static mut T {
@@ -212,4 +244,24 @@ pub fn translated_refmut<T>(token: usize, ptr: *mut T) -> &'static mut T {
         .translate_va(VirtAddr::from(va))
         .unwrap()
         .get_mut()
+}
+/// Copy `len` bytes starting at user virtual address `ptr` into an owned
+/// buffer, translating page by page. Used by syscalls that must not hand out a
+/// reference into user memory (the caller's address space may already be gone
+/// by the time it is read). Returns `None` if any page of the range is unmapped.
+pub fn copied_byte_buffer(token: usize, ptr: *const u8, len: usize) -> Option<Vec<u8>> {
+    let page_table = PageTable::from_token(token);
+    let mut buf = Vec::with_capacity(len);
+    let mut start = ptr as usize;
+    let end = start.checked_add(len)?;
+    while start < end {
+        let start_va = VirtAddr::from(start);
+        let ppn = page_table.translate(start_va.floor())?.ppn();
+        let chunk_len = core::cmp::min(end - start, PAGE_SIZE - start_va.page_offset());
+        buf.extend_from_slice(
+            &ppn.get_bytes_array()[start_va.page_offset()..start_va.page_offset() + chunk_len],
+        );
+        start += chunk_len;
+    }
+    Some(buf)
 }
