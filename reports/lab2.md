@@ -5,7 +5,7 @@
 
 ## 1. 为什么第 6 章要交 Lab 2 与 Lab 3
 
-`ci-user/Makefile` 在 `CHAPTER=6` 时取 `LAB := 4`、`INITPROC := 1`，报告闸门循环检查 `reports/lab1..lab4`。
+`ci-user/Makefile` 在 `CHAPTER=8` 时取 `LAB := 5`、`INITPROC := 1`，报告闸门循环检查 `reports/lab1..lab5`。
 判分是**累积**的：`check/ch6.py` 的 `EXPECTED_6 = set(EXPECTED_5 + EXPECTED_6b + [...]) - {"Test set_priority OK!"}`，
 所以内存与进程两章的行为在本树里必须继续成立，Lab 2/Lab 3 的记录对象就是本树的这份实现。
 
@@ -41,4 +41,7 @@
 
 ## 5. 状态
 
-本 lab 在 31 项中相关 4 项里尚差 2 项；本报告满足 `LAB := 4` 对 `lab2` 的存在性要求，内容以本树实测为准。
+本 lab 相关的 mmap/munmap 四项（`04_1`/`04_4`/`04_5`/`04_6`）在本树**已全部通过**：
+整章 31/31、`MAKE_RC=0`（`oscamp/logs/c_ch6_fix1.log`、`c_ch6_stab.log` 两轮独立复现）。
+关键处方是 `len` **向上取整**而非要求页对齐，非法请求回 `-1`，`prot=2`(W 无 R) 回 `0` 但不建映射。
+本报告满足 `LAB := 5` 对 `lab2` 的存在性要求，内容以本树实测为准。
