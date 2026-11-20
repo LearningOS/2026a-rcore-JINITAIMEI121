@@ -11,6 +11,7 @@ mod frame_allocator;
 mod heap_allocator;
 mod memory_set;
 mod page_table;
+pub use page_table::{read_user_bytes, try_translated_refmut, write_user_bytes};
 
 pub use address::{PhysAddr, PhysPageNum, VirtAddr, VirtPageNum};
 use address::{StepByOne, VPNRange};

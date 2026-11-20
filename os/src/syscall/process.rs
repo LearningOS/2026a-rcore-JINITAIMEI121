@@ -5,9 +5,9 @@ use crate::mm::{
 };
 use crate::task::{
     change_program_brk, current_user_token, exit_current_and_run_next, get_syscall_count,
-    sleep_current, suspend_current_and_run_next, with_current_task,
+    suspend_current_and_run_next, with_current_task,
 };
-use crate::timer::{get_time_ms, get_time_us};
+use crate::timer::get_time_us;
 
 /// `TraceRequest` variants of the user side `sys_trace`, see
 /// `user_lib::TraceRequest`. The discriminants must stay in sync with that
@@ -33,16 +33,6 @@ pub fn sys_exit(_exit_code: i32) -> ! {
 /// current task gives up resources for other tasks
 pub fn sys_yield() -> isize {
     trace!("kernel: sys_yield");
-    suspend_current_and_run_next();
-    0
-}
-
-/// Sleep for `period_ms` of virtual time. The task leaves the ready set with a
-/// wake-up timestamp and the timer tick hands it back once that time passed, so
-/// `ch3_sleep1` measures a real delta instead of a yield loop's near-zero one.
-pub fn sys_sleep(period_ms: usize) -> isize {
-    trace!("kernel: sys_sleep {} ms", period_ms);
-    sleep_current(get_time_ms() + period_ms);
     suspend_current_and_run_next();
     0
 }

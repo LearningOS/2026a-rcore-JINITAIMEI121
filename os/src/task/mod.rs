@@ -93,68 +93,7 @@ impl TaskManager {
     fn mark_current_suspended(&self) {
         let mut inner = self.inner.exclusive_access();
         let cur = inner.current_task;
-        // A task that called `sys_sleep` must keep `Sleeping`: promoting it to
-        // `Ready` here would let it run again before its wake-up time, and the
-        // measured sleep delta would collapse to zero.
-        if inner.tasks[cur].task_status == TaskStatus::Running {
-            inner.tasks[cur].task_status = TaskStatus::Ready;
-        }
-    }
-
-    /// Put the current task to sleep until `wake_ms` (virtual milliseconds).
-    fn sleep_current(&self, wake_ms: usize) {
-        let mut inner = self.inner.exclusive_access();
-        let cur = inner.current_task;
-        inner.tasks[cur].wake_ms = wake_ms;
-        inner.tasks[cur].task_status = TaskStatus::Sleeping;
-    }
-
-    /// Hand every task whose wake-up time has passed back to the scheduler.
-    /// Called once per timer tick.
-    fn wakeup_sleeping(&self, now_ms: usize) {
-        let mut inner = self.inner.exclusive_access();
-        for task in inner.tasks.iter_mut() {
-            if task.task_status == TaskStatus::Sleeping && task.wake_ms <= now_ms {
-                task.task_status = TaskStatus::Ready;
-            }
-        }
-    }
-
-    /// Whether some task is merely asleep, and if so wait until at least one of
-    /// them is due. Returns `false` when nothing is left but exited tasks.
-    ///
-    /// This runs with supervisor interrupts disabled, which is deliberate: the
-    /// `mtime` counter advances regardless, and letting the timer handler
-    /// schedule from inside this wait would save the wait loop into a sleeper's
-    /// `TaskContext`, so that task could never return to user mode afterwards.
-    fn wait_for_sleepers(&self) -> bool {
-        loop {
-            let now = crate::timer::get_time_ms();
-            let mut any_sleeping = false;
-            let mut any_ready = false;
-            {
-                let mut inner = self.inner.exclusive_access();
-                for task in inner.tasks.iter_mut() {
-                    if task.task_status == TaskStatus::Sleeping {
-                        if task.wake_ms <= now {
-                            task.task_status = TaskStatus::Ready;
-                        } else {
-                            any_sleeping = true;
-                        }
-                    }
-                    if task.task_status == TaskStatus::Ready {
-                        any_ready = true;
-                    }
-                }
-            }
-            if any_ready {
-                return true;
-            }
-            if !any_sleeping {
-                return false;
-            }
-            core::hint::spin_loop();
-        }
+        inner.tasks[cur].task_status = TaskStatus::Ready;
     }
 
     /// Change the status of current `Running` task into `Exited`.
@@ -219,27 +158,21 @@ impl TaskManager {
     /// Switch current `Running` task to the task we have found,
     /// or there is no `Ready` task and we can exit with all applications completed
     fn run_next_task(&self) {
-        loop {
-            if let Some(next) = self.find_next_task() {
-                let mut inner = self.inner.exclusive_access();
-                let current = inner.current_task;
-                inner.tasks[next].task_status = TaskStatus::Running;
-                inner.current_task = next;
-                let current_task_cx_ptr = &mut inner.tasks[current].task_cx as *mut TaskContext;
-                let next_task_cx_ptr = &inner.tasks[next].task_cx as *const TaskContext;
-                drop(inner);
-                // before this, we should drop local variables that must be dropped manually
-                unsafe {
-                    __switch(current_task_cx_ptr, next_task_cx_ptr);
-                }
-                // go back to user mode
-                return;
+        if let Some(next) = self.find_next_task() {
+            let mut inner = self.inner.exclusive_access();
+            let current = inner.current_task;
+            inner.tasks[next].task_status = TaskStatus::Running;
+            inner.current_task = next;
+            let current_task_cx_ptr = &mut inner.tasks[current].task_cx as *mut TaskContext;
+            let next_task_cx_ptr = &inner.tasks[next].task_cx as *const TaskContext;
+            drop(inner);
+            // before this, we should drop local variables that must be dropped manually
+            unsafe {
+                __switch(current_task_cx_ptr, next_task_cx_ptr);
             }
-            // Nothing is `Ready`. If the remaining tasks are merely asleep,
-            // wait for their wake-up time rather than ending the whole batch.
-            if !self.wait_for_sleepers() {
-                panic!("All applications completed!");
-            }
+            // go back to user mode
+        } else {
+            panic!("All applications completed!");
         }
     }
 }
@@ -269,16 +202,6 @@ fn mark_current_exited() {
 pub fn suspend_current_and_run_next() {
     mark_current_suspended();
     run_next_task();
-}
-
-/// Put the current task to sleep until `wake_ms` (virtual milliseconds).
-pub fn sleep_current(wake_ms: usize) {
-    TASK_MANAGER.sleep_current(wake_ms);
-}
-
-/// Wake every sleeping task whose wake-up time has passed. Called per timer tick.
-pub fn wakeup_sleeping(now_ms: usize) {
-    TASK_MANAGER.wakeup_sleeping(now_ms);
 }
 
 /// Exit the current 'Running' task and run the next task in task list.

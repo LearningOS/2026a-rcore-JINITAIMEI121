@@ -36,9 +36,6 @@ pub struct TaskControlBlock {
     /// id `i`, so it already includes the call currently being handled. This
     /// is what `sys_trace(TraceRequest::Syscall, id, _)` reports.
     pub syscall_counter: Vec<usize>,
-
-    /// Virtual wake-up time (ms) of a `Sleeping` task; meaningless otherwise.
-    pub wake_ms: usize,
 }
 
 impl TaskControlBlock {
@@ -75,7 +72,6 @@ impl TaskControlBlock {
             heap_bottom: user_sp,
             program_brk: user_sp,
             syscall_counter: vec![0; MAX_SYSCALL_NUM],
-            wake_ms: 0,
         };
         // prepare TrapContext in user space
         let trap_cx = task_control_block.get_trap_cx();
@@ -122,6 +118,4 @@ pub enum TaskStatus {
     Running,
     /// exited
     Exited,
-    /// waiting for its virtual wake-up time; the scheduler must not pick it
-    Sleeping,
 }

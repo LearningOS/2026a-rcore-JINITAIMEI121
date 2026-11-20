@@ -262,6 +262,49 @@ impl MemorySet {
             false
         }
     }
+    /// Whether every page of `[start_vpn, end_vpn)` is currently unmapped.
+    /// `sys_mmap` uses it so that it never overwrites pages already owned by
+    /// another mapping (the elf sections, the user stack, the heap area, ...).
+    pub fn is_range_free(&self, start_vpn: VirtPageNum, end_vpn: VirtPageNum) -> bool {
+        (start_vpn.0..end_vpn.0).all(|vpn| !self.page_table.is_mapped(VirtPageNum(vpn)))
+    }
+    /// Whether every page of `[start_vpn, end_vpn)` is currently mapped.
+    /// `sys_munmap` uses it to reject a range the process does not fully own.
+    pub fn is_range_mapped(&self, start_vpn: VirtPageNum, end_vpn: VirtPageNum) -> bool {
+        (start_vpn.0..end_vpn.0).all(|vpn| self.page_table.is_mapped(VirtPageNum(vpn)))
+    }
+    /// Unmap and drop every `MapArea` whose vpn range lies inside
+    /// `[start_vpn, end_vpn)`. An area only partially covered by the range is
+    /// *not* touched, which makes the whole request illegal: it would mean the
+    /// caller asked for a range crossing the border of one of its regions.
+    /// Returns whether at least one area was removed.
+    pub fn remove_area_in_range(&mut self, start_vpn: VirtPageNum, end_vpn: VirtPageNum) -> bool {
+        if self
+            .areas
+            .iter()
+            .any(|area| area.is_partially_covered(start_vpn, end_vpn))
+        {
+            return false;
+        }
+        let mut removed = false;
+        let mut index = 0;
+        while index < self.areas.len() {
+            let contained = self.areas[index].is_contained_in(start_vpn, end_vpn);
+            if contained {
+                // dropping the area drops its FrameTrackers, which recycles the
+                // physical pages; the page table entries go away first.
+                let area = self.areas.remove(index);
+                for vpn in area.vpn_range {
+                    self.page_table.unmap(vpn);
+                }
+                drop(area);
+                removed = true;
+            } else {
+                index += 1;
+            }
+        }
+        removed
+    }
 }
 /// map area structure, controls a contiguous piece of virtual memory
 pub struct MapArea {
@@ -333,6 +376,19 @@ impl MapArea {
             self.map_one(page_table, vpn)
         }
         self.vpn_range = VPNRange::new(self.vpn_range.get_start(), new_end);
+    }
+    /// Is the whole area inside `[start_vpn, end_vpn)`?
+    pub fn is_contained_in(&self, start_vpn: VirtPageNum, end_vpn: VirtPageNum) -> bool {
+        self.vpn_range.get_start().0 >= start_vpn.0 && self.vpn_range.get_end().0 <= end_vpn.0
+    }
+    /// Does `[start_vpn, end_vpn)` overlap this area without covering it fully?
+    pub fn is_partially_covered(&self, start_vpn: VirtPageNum, end_vpn: VirtPageNum) -> bool {
+        let l = self.vpn_range.get_start().0;
+        let r = self.vpn_range.get_end().0;
+        // intersection non-empty ...
+        (l < end_vpn.0 && start_vpn.0 < r)
+            // ... but the area is not contained in the range
+            && !(l >= start_vpn.0 && r <= end_vpn.0)
     }
     /// data: start-aligned but maybe with shorter length
     /// assume that all frames were cleared before

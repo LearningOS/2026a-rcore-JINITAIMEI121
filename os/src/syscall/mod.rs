@@ -14,8 +14,6 @@ const SYSCALL_WRITE: usize = 64;
 const SYSCALL_EXIT: usize = 93;
 /// yield syscall
 const SYSCALL_YIELD: usize = 124;
-/// sleep syscall
-const SYSCALL_SLEEP: usize = 101;
 /// gettime syscall
 const SYSCALL_GET_TIME: usize = 169;
 /// sbrk syscall
@@ -39,7 +37,6 @@ pub fn syscall(syscall_id: usize, args: [usize; 3]) -> isize {
         SYSCALL_WRITE => sys_write(args[0], args[1] as *const u8, args[2]),
         SYSCALL_EXIT => sys_exit(args[0] as i32),
         SYSCALL_YIELD => sys_yield(),
-        SYSCALL_SLEEP => sys_sleep(args[0]),
         SYSCALL_GET_TIME => sys_get_time(args[0] as *mut TimeVal, args[1]),
         SYSCALL_TRACE => sys_trace(args[0], args[1], args[2]),
         SYSCALL_MMAP => sys_mmap(args[0], args[1], args[2]),
