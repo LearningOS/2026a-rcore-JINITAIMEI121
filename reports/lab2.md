@@ -45,20 +45,36 @@ make 链返回 0**（含本报告存在的检查）。
 `current time_msec = 0` 紧跟 `Panicked at src/bin/ch3_sleep.rs:16, assertion failed: current_time > 0`；
 `Panicked at src/bin/ch4_unmap.rs:21, assertion left == right failed`。
 
-## 4. 已知根因与本章坑
+## 4. 已知根因与本章坑（最终核实）
 
-1. **本树没有 `sys_sleep`**。按上面第 2 节的符号清单核对，`os/src/syscall/` 里只有 `sys_yield`；
-   而 `EXPECTED_4` 通过 `EXPECTED_3` 继承了 sleep 家族三项。第 5 章树里 `sys_sleep` 是存在的，
-   且那边 `current time_msec = 59` 有值、本章为 0 —— 同族两树的差异正是这一项的直接解释。
-   修法是把 sleep 的阻塞-唤醒语义补进本章（配合 `os/src/task` 的就绪队列与 `timer.rs` 的时钟中断），
-   而不是放宽判分脚本。
-2. **`#![deny(warnings)]`**：`os/src/main.rs:19` 使任何警告成为致命错误，未使用 import 会直接让
+1. **`try_translated_refmut` 丢掉页内偏移**（`os/src/mm/page_table.rs`）。它返回
+   `PhysAddr::from(first.ppn()).get_mut::<T>()`，即**物理页首地址**，没有加回 `va.page_offset()`。
+   于是 `sys_get_time` 把秒/微秒写进了物理页的第 0 字节，用户栈上的 `TimeVal` 始终为 0：
+   `ch3_sleep` 在 `assert!(current_time > 0)` 处 panic，`ch3_sleep1` 的
+   `while get_time() < start + 100` 变成**死循环**，整批被官方 30s 预算截断，
+   trace 家族的字符串因此根本没机会打印。修法是加回页内偏移。
+   **更正一条早期归因**：本报告先前写"本树没有 `sys_sleep` 是根因"，那是错的。
+   pinned 测试仓的 `user_lib::sleep()` 是 `get_time() + yield_()` 忙等循环，**不发 syscall 101**
+   （只有 `sleep_blocking()` 才发）；旧日志里 `Unsupported syscall_id` 命中数为 **0**。
+   据此我曾移植整套内核 sleep（`Sleeping` 状态 + 唤醒 + 调度器兜底），核实后**已全部撤回**：
+   它对判分不是必需的，且那条"全在睡就自旋等 mtime"的兜底路径在任何用例里都不可达。
+2. **`#![deny(warnings)]`**：`os/src/main.rs` 使任何警告成为致命错误，未使用 import 会直接让
    `make kernel` 失败（本项目里 ch3 曾因 `sip` 未使用与缺 `pub use context::TrapContext` 从 5/7 掉到 0/7）。
-3. **地址校验要覆盖全部真被映射的区间**：第 3 章的 `Panicked … assertion failed: current_time > 0`
-   根因是只校验 app 区、把落在用户栈上的 `TimeVal` 判成非法指针。第 4 章用户栈已进入页表，
-   同一族修法应当落在页表翻译上（拒绝未映射/不可写地址，同时不拒绝合法栈指针）。
+   删调用方必须连带删被调方，否则 dead_code 同样致命。
+3. **`sys_mmap`/`sys_munmap` 的 `len` 必须向上取整**，不能要求页对齐：
+   `ch4_unmap` 断言 `mmap(start-len, len+1, 3) == 0`（那两页刚被 munmap 释放），
+   而 `ch4_mmap3` 对同一形状的请求断言 `-1`（那两页仍被占用）——
+   区分二者的唯一依据是"范围是否空闲"，不是 `len` 是否对齐。
+   `ch4_unmap2` 的 `munmap(start, len+1)` 与 `munmap(start+1, len-1)` 都必须回 `-1`。
+4. **判据要看 V 位，不是"页表项是否存在"**：`find_pte` 末级无条件返回 `Some`，
+   映射一页会分配覆盖 2MB 的中间页表，同区其余页遂成为"存在但空"的 PTE。
+   本树的 `is_range_free`/`is_range_mapped` 走 `page_table.is_mapped()`（已验 V 位）故无此问题，
+   但第 5 章同名函数曾因此误拒合法映射——跨章移植时必须逐树核对，不能假设同构。
 
 ## 5. 状态
 
-16 项中 9 项通过；剩余 7 项如上。本报告与 `reports/lab1.md` 一起满足 `LAB := 2` 的报告闸门。
+**16/16，`MAKE_RC=0`**，两轮独立复现（`oscamp/logs/c_ch4_sl3.log`、`c_ch4_stab.log`），
+`rig_c_gaps.py ch4` 给出 `需补齐=0`、`不该出现却出现了=0`。
+本报告与 `reports/lab1.md` 一起满足 `LAB := 2` 的报告闸门（两者均已 git 跟踪）。
 判分器、`os/build.rs`、`os/Makefile`、`easy-fs-fuse/src/main.rs` 会被判分流程覆盖，本实验未改动它们。
+CI 侧硬断言 QEMU 8.2.x，本地测量用 Homebrew QEMU 11.1.3，这是与 CI 的唯一实质环境差。
