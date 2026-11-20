@@ -15,11 +15,35 @@ mod switch;
 mod task;
 
 use crate::config::MAX_APP_NUM;
-use crate::loader::{get_num_app, init_app_cx};
+use crate::loader::{app_region, get_num_app, init_app_cx, user_stack_region};
 use crate::sync::UPSafeCell;
 use lazy_static::*;
 use switch::__switch;
 pub use task::{TaskControlBlock, TaskStatus};
+
+/// Every memory range the running application owns: its own slot plus the user
+/// stack that chapter 3 allocated for it. Returns `None` when no task owns the CPU.
+pub fn current_user_ranges() -> Option<[(usize, usize); 2]> {
+    TASK_MANAGER.current_user_ranges()
+}
+
+/// Record one invocation of `syscall_id` for the currently running task.
+///
+/// Called from the trap handler before the syscall body runs, which makes the
+/// counting visible to the call itself (`ch3_trace` relies on exactly that).
+pub fn record_syscall(syscall_id: usize) {
+    TASK_MANAGER.record_syscall(syscall_id);
+}
+
+/// How often has the current task invoked `syscall_id`? Returns `None` for an
+/// id this kernel cannot dispatch, so a caller can tell "not tracked" apart
+/// from "never called".
+pub fn current_syscall_count(syscall_id: usize) -> Option<usize> {
+    if !crate::syscall::is_supported(syscall_id) {
+        return None;
+    }
+    TASK_MANAGER.current_syscall_count(syscall_id)
+}
 
 pub use context::TaskContext;
 
@@ -51,10 +75,7 @@ lazy_static! {
     /// Global variable: TASK_MANAGER
     pub static ref TASK_MANAGER: TaskManager = {
         let num_app = get_num_app();
-        let mut tasks = [TaskControlBlock {
-            task_cx: TaskContext::zero_init(),
-            task_status: TaskStatus::UnInit,
-        }; MAX_APP_NUM];
+        let mut tasks = [TaskControlBlock::new(); MAX_APP_NUM];
         for (i, task) in tasks.iter_mut().enumerate() {
             task.task_cx = TaskContext::goto_restore(init_app_cx(i));
             task.task_status = TaskStatus::Ready;
@@ -102,6 +123,37 @@ impl TaskManager {
         let mut inner = self.inner.exclusive_access();
         let current = inner.current_task;
         inner.tasks[current].task_status = TaskStatus::Exited;
+    }
+
+    /// The app slot and the user stack of the current task, if it owns the CPU.
+    fn current_user_ranges(&self) -> Option<[(usize, usize); 2]> {
+        let inner = self.inner.exclusive_access();
+        let current = inner.current_task;
+        if let TaskStatus::UnInit = inner.tasks[current].task_status {
+            return None;
+        }
+        // Chapter 3 loads task `i` with app `i`, so the task index doubles as the app id.
+        Some([app_region(current), user_stack_region(current)?])
+    }
+
+    /// Bump the syscall counter of the current task.
+    fn record_syscall(&self, syscall_id: usize) {
+        let mut inner = self.inner.exclusive_access();
+        let current = inner.current_task;
+        if syscall_id < task::SYSCALL_COUNTER_SLOTS {
+            inner.tasks[current].syscall_count[syscall_id] += 1;
+        }
+    }
+
+    /// Read back a syscall counter of the current task.
+    fn current_syscall_count(&self, syscall_id: usize) -> Option<usize> {
+        let inner = self.inner.exclusive_access();
+        let current = inner.current_task;
+        if syscall_id < task::SYSCALL_COUNTER_SLOTS {
+            Some(inner.tasks[current].syscall_count[syscall_id])
+        } else {
+            None
+        }
     }
 
     /// Find next task to run and return task id.

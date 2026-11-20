@@ -9,6 +9,31 @@ use crate::config::*;
 use crate::trap::TrapContext;
 use core::arch::asm;
 
+/// The memory range `[start, end)` that was handed to application `app_id`.
+///
+/// Chapter 3 maps every app into a static slot of the physical address space,
+/// so this is the only notion of "address space" the kernel has. Syscalls that
+/// take a user pointer (`sys_trace`, `sys_write`) check it against this range
+/// before dereferencing anything, which keeps a bogus pointer from faulting the
+/// kernel itself.
+pub fn app_region(app_id: usize) -> (usize, usize) {
+    let base = get_base_i(app_id);
+    (base, base + APP_SIZE_LIMIT)
+}
+
+/// The memory range `[start, end)` of the user stack allocated to application
+/// `app_id`.
+///
+/// Chapter 3 hands each app a *statically* allocated stack that lives in the
+/// kernel image, i.e. outside `app_region()`. Locals such as the `TimeVal` of
+/// `sys_get_time` are only reachable through this range, so a pointer check that
+/// looks at the app region alone rejects legitimate user pointers.
+pub fn user_stack_region(app_id: usize) -> Option<(usize, usize)> {
+    let stack = USER_STACK.get(app_id)?;
+    let base = stack.data.as_ptr() as usize;
+    Some((base, base + USER_STACK_SIZE))
+}
+
 #[repr(align(4096))]
 #[derive(Copy, Clone)]
 struct KernelStack {
