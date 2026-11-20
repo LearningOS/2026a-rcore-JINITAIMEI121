@@ -4,7 +4,7 @@ use super::{frame_alloc, FrameTracker};
 use super::{PTEFlags, PageTable, PageTableEntry};
 use super::{PhysAddr, PhysPageNum, VirtAddr, VirtPageNum};
 use super::{StepByOne, VPNRange};
-use crate::config::{MEMORY_END, MMIO, PAGE_SIZE, TRAMPOLINE};
+use crate::config::{MEMORY_END, MMIO, PAGE_SIZE, TRAMPOLINE, TRAP_CONTEXT_BASE};
 use crate::sync::UPSafeCell;
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
@@ -12,6 +12,10 @@ use alloc::vec::Vec;
 use core::arch::asm;
 use lazy_static::*;
 use riscv::register::satp;
+
+/// The largest size a single `sys_mmap` request may map. It also reserves
+/// enough room below the trap-context area for thread stacks.
+pub const MAX_MAP_SIZE: usize = 4 * 1024 * 1024;
 
 extern "C" {
     fn stext();
@@ -262,6 +266,139 @@ impl MemorySet {
     ///Remove all `MapArea`
     pub fn recycle_data_pages(&mut self) {
         self.areas.clear();
+    }
+
+    /// Is there any mapped page in `[start, end)`? Used to check that an mmap
+    /// request does not overlap with something already mapped.
+    pub fn is_mapped(&self, start: VirtAddr, end: VirtAddr) -> bool {
+        let mut vpn = start.floor();
+        let end_vpn = end.ceil();
+        while vpn < end_vpn {
+            if self.page_table.translate(vpn).is_some() {
+                return true;
+            }
+            vpn.step();
+        }
+        false
+    }
+
+    /// Map `[start, end)` to freshly allocated zero-filled frames with the
+    /// given permission. Returns `None` when out of memory.
+    pub fn map_pages(
+        &mut self,
+        start: VirtAddr,
+        end: VirtAddr,
+        permission: MapPermission,
+    ) -> Option<()> {
+        if self.is_mapped(start, end) {
+            return None;
+        }
+        self.push(
+            MapArea::new(start, end, MapType::Framed, permission),
+            None,
+        );
+        Some(())
+    }
+
+    /// Unmap every page of `[start, end)` and drop the areas (and the frame
+    /// trackers holding their physical pages) which lie fully inside it.
+    pub fn unmap_area(&mut self, start: VirtAddr, end: VirtAddr) {
+        let start_vpn: VirtPageNum = start.floor();
+        let end_vpn: VirtPageNum = end.ceil();
+        // first clear the pte's of the whole range so that partial areas are
+        // also unmapped
+        for vpn in VPNRange::new(start_vpn, end_vpn) {
+            self.page_table.unmap(vpn);
+        }
+        self.areas.retain(|area| {
+            area.vpn_range.get_start() < start_vpn || area.vpn_range.get_end() > end_vpn
+        });
+        unsafe {
+            asm!("sfence.vma");
+        }
+    }
+
+    /// The lowest page-aligned virtual address above `hint` whose following
+    /// `pages` pages are all free. At least `MAX_MAP_SIZE` bytes below the trap
+    /// context area stay reserved (that is where thread stacks live).
+    pub fn find_free_va(&self, hint: usize, pages: usize) -> Option<VirtAddr> {
+        let limit = TRAP_CONTEXT_BASE - MAX_MAP_SIZE;
+        let mut vpn = VirtAddr::from(hint).ceil();
+        while usize::from(vpn) + pages * PAGE_SIZE <= limit {
+            let start: VirtAddr = vpn.into();
+            let end: VirtAddr = (usize::from(start) + pages * PAGE_SIZE).into();
+            if !self.is_mapped(start, end) {
+                return Some(start);
+            }
+            vpn = VirtPageNum::from(end);
+            vpn.step();
+        }
+        None
+    }
+
+    /// Grow/shrink the contiguous data segment that starts at `start`.
+    ///
+    /// This is the backend of `sys_sbrk`: a negative `delta` only succeeds
+    /// when it really shrinks the segment, a positive one appends freshly
+    /// allocated (zeroed) pages to the same `MapArea`.  When the segment was
+    /// previously shrunk to zero it is recreated at `start`.
+    /// Returns the new size of the segment, or `None` on failure.
+    pub fn change_brk(&mut self, start: VirtAddr, delta: isize) -> Option<usize> {
+        let area_idx = self
+            .areas
+            .iter()
+            .position(|area| area.vpn_range.get_start() == start.floor());
+        let area_idx = match area_idx {
+            Some(idx) => idx,
+            None => {
+                // no data segment yet (or it was shrunk to zero): create one
+                if delta < 0 {
+                    return None;
+                }
+                let perm = MapPermission::R | MapPermission::W | MapPermission::U;
+                let end: VirtAddr = (usize::from(start) + ((delta as usize + PAGE_SIZE - 1) / PAGE_SIZE) * PAGE_SIZE).into();
+                self.push(MapArea::new(start, end, MapType::Framed, perm), None);
+                return Some(usize::from(end) - usize::from(start));
+            }
+        };
+        let cur_size = usize::from(self.areas[area_idx].vpn_range.get_end())
+            - usize::from(self.areas[area_idx].vpn_range.get_start());
+        let new_size = (cur_size as isize + delta).max(0) as usize;
+        if delta < 0 && new_size >= cur_size {
+            // shrinking must actually shrink
+            return None;
+        }
+        if new_size == cur_size {
+            return Some(cur_size);
+        }
+        let new_end: VirtAddr = (usize::from(start) + new_size).into();
+        if delta > 0 {
+            // refuse to grow into something already mapped (thread stacks,
+            // trap contexts, another mapping)
+            let grow_start: VirtAddr = self.areas[area_idx].vpn_range.get_end().into();
+            if self.is_mapped(grow_start, new_end.ceil().into()) {
+                return None;
+            }
+            self.areas[area_idx]
+                .append_to(&mut self.page_table, new_end.ceil());
+        } else {
+            self.areas[area_idx].shrink_to(&mut self.page_table, new_end.ceil());
+            if new_size == 0 {
+                // an empty area is useless and would hide the fact that the
+                // segment is gone
+                self.areas.remove(area_idx);
+            }
+        }
+        unsafe { asm!("sfence.vma") };
+        Some(new_size)
+    }
+
+    /// Does an area start exactly at `va`? Used by `sys_sbrk` to know whether
+    /// the data segment still exists after a previous shrink-to-zero.
+    pub fn has_area_at(&self, va: VirtAddr) -> bool {
+        self.areas
+            .iter()
+            .any(|area| area.vpn_range.get_start() == va.floor())
     }
 
     /// shrink the area to new_end

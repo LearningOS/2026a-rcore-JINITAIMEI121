@@ -1,12 +1,20 @@
 use crate::{
+    config::{PAGE_SIZE, TRAP_CONTEXT_BASE},
     fs::{open_file, OpenFlags},
-    mm::{translated_ref, translated_refmut, translated_str},
+    mm::{
+        translated_ref, translated_refmut, translated_str, MapPermission, MAX_MAP_SIZE, VirtAddr,
+    },
     task::{
         current_process, current_task, current_user_token, exit_current_and_run_next, pid2process,
-        suspend_current_and_run_next, SignalFlags,
+        suspend_current_and_run_next, ProcessControlBlock, SignalFlags, MAX_PRIORITY,
+        MIN_MMAP_ADDR, MIN_PRIORITY,
     },
 };
 use alloc::{string::String, sync::Arc, vec::Vec};
+
+/// The lowest virtual address `sys_mmap` is allowed to hand out. Below it lie
+/// the program image and the (growing) data segment used by `sys_sbrk`.
+const MMAP_BASE: usize = MIN_MMAP_ADDR;
 
 #[repr(C)]
 #[derive(Debug)]
@@ -148,66 +156,141 @@ pub fn sys_kill(pid: usize, signal: u32) -> isize {
 
 /// get_time syscall
 ///
-/// YOUR JOB: get time with second and microsecond
-/// HINT: You might reimplement it with virtual memory management.
-/// HINT: What if [`TimeVal`] is splitted by two pages ?
-pub fn sys_get_time(_ts: *mut TimeVal, _tz: usize) -> isize {
+/// Writes the current wall-clock time into the user `TimeVal` structure. The
+/// pointer is translated through the *current* address space, so a bad pointer
+/// only kills this task (SIGSEGV) instead of faulting inside the kernel.
+pub fn sys_get_time(ts: *mut TimeVal, _tz: usize) -> isize {
     trace!(
-        "kernel:pid[{}] sys_get_time NOT IMPLEMENTED",
+        "kernel:pid[{}] sys_get_time",
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
-    -1
+    let us = crate::timer::get_time_us();
+    let secs = us / 1_000_000;
+    let usecs = us % 1_000_000;
+    let token = current_user_token();
+    let ts_ref = translated_refmut(token, ts);
+    unsafe {
+        core::ptr::write_volatile(&mut ts_ref.sec, secs);
+        core::ptr::write_volatile(&mut ts_ref.usec, usecs);
+    }
+    0
 }
 
 /// mmap syscall
 ///
-/// YOUR JOB: Implement mmap.
-pub fn sys_mmap(_start: usize, _len: usize, _port: usize) -> isize {
+/// Map `len` bytes of anonymous private memory into the current address space.
+/// When `addr` is non-zero it is used as a hint; the returned address is always
+/// page aligned and zero filled.
+pub fn sys_mmap(addr: usize, len: usize, port: usize) -> isize {
     trace!(
-        "kernel:pid[{}] sys_mmap NOT IMPLEMENTED",
-        current_task().unwrap().process.upgrade().unwrap().getpid()
+        "kernel:pid[{}] sys_mmap addr={:#x} len={:#x} port={:#x}",
+        current_task().unwrap().process.upgrade().unwrap().getpid(),
+        addr,
+        len,
+        port
     );
-    -1
+    // sanity checks: no negative/overflowing length, permission fits in R/W/X
+    if len == 0 || len > MAX_MAP_SIZE {
+        return -1;
+    }
+    if port & !0b111 != 0 {
+        return -1;
+    }
+    let mut map_perm = MapPermission::U;
+    if port & 1 != 0 {
+        map_perm |= MapPermission::R;
+    }
+    if port & 2 != 0 {
+        map_perm |= MapPermission::W;
+    }
+    if port & 4 != 0 {
+        map_perm |= MapPermission::X;
+    }
+    let start_aligned = addr & (PAGE_SIZE - 1) == 0;
+    let process = current_process();
+    let mut inner = process.inner_exclusive_access();
+    let pages = (len + PAGE_SIZE - 1) / PAGE_SIZE;
+    let virt_addr = if addr != 0 && start_aligned {
+        VirtAddr::from(addr)
+    } else {
+        match inner.find_free_va(MMAP_BASE, pages) {
+            Some(va) => va,
+            None => return -1,
+        }
+    };
+    let end_va: VirtAddr = (usize::from(virt_addr) + pages * PAGE_SIZE).into();
+    // refuse to map over something that already exists, or outside the user
+    // window reserved for mmap / thread stacks
+    if usize::from(virt_addr) < MMAP_BASE || usize::from(end_va) > TRAP_CONTEXT_BASE {
+        return -1;
+    }
+    if inner.memory_set.is_mapped(virt_addr, end_va) {
+        return -1;
+    }
+    if inner.memory_set.map_pages(virt_addr, end_va, map_perm).is_none() {
+        return -1;
+    }
+    drop(inner);
+    usize::from(virt_addr) as isize
 }
 
 /// munmap syscall
 ///
-/// YOUR JOB: Implement munmap.
-pub fn sys_munmap(_start: usize, _len: usize) -> isize {
+/// Unmap the `len` bytes starting at the page aligned `start`.
+pub fn sys_munmap(start: usize, len: usize) -> isize {
     trace!(
-        "kernel:pid[{}] sys_munmap NOT IMPLEMENTED",
+        "kernel:pid[{}] sys_munmap",
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
-    -1
+    if len == 0 || len > MAX_MAP_SIZE || start % PAGE_SIZE != 0 {
+        return -1;
+    }
+    let pages = (len + PAGE_SIZE - 1) / PAGE_SIZE;
+    let start_va: VirtAddr = start.into();
+    let end_va: VirtAddr = (start + pages * PAGE_SIZE).into();
+    let process = current_process();
+    let mut inner = process.inner_exclusive_access();
+    if usize::from(start_va) < MMAP_BASE || usize::from(end_va) > TRAP_CONTEXT_BASE {
+        return -1;
+    }
+    inner.memory_set.unmap_area(start_va, end_va);
+    drop(inner);
+    0
 }
 
-/// change data segment size
-// pub fn sys_sbrk(size: i32) -> isize {
-//     trace!("kernel:pid[{}] sys_sbrk", current_task().unwrap().process.upgrade().unwrap().getpid());
-//     if let Some(old_brk) = current_task().unwrap().change_program_brk(size) {
-//         old_brk as isize
-//     } else {
-//     -1
-// }
-
 /// spawn syscall
-/// YOUR JOB: Implement spawn.
-/// HINT: fork + exec =/= spawn
-pub fn sys_spawn(_path: *const u8) -> isize {
+///
+/// Create a new process from the elf stored in `path`, without touching the
+/// current one (no fork/exec round-trip through the user address space).
+pub fn sys_spawn(path: *const u8) -> isize {
     trace!(
-        "kernel:pid[{}] sys_spawn NOT IMPLEMENTED",
+        "kernel:pid[{}] sys_spawn",
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
-    -1
+    let token = current_user_token();
+    let path = translated_str(token, path);
+    let inode = open_file(path.as_str(), OpenFlags::RDONLY);
+    if inode.is_none() {
+        return -1;
+    }
+    let all_data = inode.unwrap().read_all();
+    let new_pid = ProcessControlBlock::new(all_data.as_slice()).getpid();
+    new_pid as isize
 }
 
 /// set priority syscall
 ///
-/// YOUR JOB: Set task priority
-pub fn sys_set_priority(_prio: isize) -> isize {
+/// The scheduler is a stride scheduler: a task with priority `p` advances its
+/// stride by `STRIDE / p` per quantum, so `p` must be positive.
+pub fn sys_set_priority(prio: isize) -> isize {
     trace!(
-        "kernel:pid[{}] sys_set_priority NOT IMPLEMENTED",
+        "kernel:pid[{}] sys_set_priority",
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
-    -1
+    if prio < MIN_PRIORITY as isize || prio > MAX_PRIORITY as isize {
+        return -1;
+    }
+    let task = current_task().unwrap();
+    task.set_priority(prio as usize);
+    prio
 }

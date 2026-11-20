@@ -134,6 +134,14 @@ impl EasyFileSystem {
     pub fn get_data_block_id(&self, data_block_id: u32) -> u32 {
         self.data_area_start_block + data_block_id
     }
+    /// The inverse of [`EasyFileSystem::get_disk_inode_pos`]: recover the raw
+    /// inode id from its on-disk location.
+    pub fn inode_id_of(&self, block_id: usize, block_offset: usize) -> usize {
+        let inode_size = core::mem::size_of::<DiskInode>();
+        let inodes_per_block = BLOCK_SZ / inode_size;
+        (block_id - self.inode_area_start_block as usize) * inodes_per_block
+            + block_offset / inode_size
+    }
     /// allocate a new inode, return its inode_id
     pub fn alloc_inode(&mut self) -> u32 {
         self.inode_bitmap.alloc(&self.block_device).unwrap() as u32

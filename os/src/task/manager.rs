@@ -11,12 +11,20 @@ use lazy_static::*;
 ///A array of `TaskControlBlock` that is thread-safe
 pub struct TaskManager {
     ready_queue: VecDeque<Arc<TaskControlBlock>>,
-    
+
     /// The stopping task, leave a reference so that the kernel stack will not be recycled when switching tasks
     stop_task: Option<Arc<TaskControlBlock>>,
 }
 
-/// A simple FIFO scheduler.
+/// A stride scheduler.
+///
+/// Every task owns a `stride` counter which is advanced by
+/// `STRIDE_1 / priority` each time it consumes a scheduling quantum.  The
+/// ready task with the smallest stride runs next, which makes the CPU time
+/// distribution proportional to the priorities (`ch5_stride*` tests).  A task
+/// that joins the queue with a stride below everybody else's (a woken-up
+/// sleeping task, a brand new process) is raised to the current baseline, so
+/// it neither jumps the whole queue nor drags the other counters around.
 impl TaskManager {
     ///Creat an empty TaskManager
     pub fn new() -> Self {
@@ -27,11 +35,38 @@ impl TaskManager {
     }
     /// Add process back to ready queue
     pub fn add(&mut self, task: Arc<TaskControlBlock>) {
+        // Raise the newcomer to the baseline instead of shifting every queued
+        // task up by `min - stride`: the latter adds the queue minimum to all
+        // strides on *every* wakeup, so they grow exponentially and wrap
+        // `isize` within seconds.  A wrapped task sits at the smallest stride
+        // forever and starves every runnable thread, silently.
+        let base = self
+            .ready_queue
+            .iter()
+            .map(|t| t.inner_exclusive_access().stride)
+            .min();
+        if let Some(min_stride) = base {
+            let mut inner = task.inner_exclusive_access();
+            if inner.stride < min_stride {
+                inner.stride = min_stride;
+            }
+        }
         self.ready_queue.push_back(task);
     }
-    /// Take a process out of the ready queue
+    /// Take the most urgent process out of the ready queue
     pub fn fetch(&mut self) -> Option<Arc<TaskControlBlock>> {
-        self.ready_queue.pop_front()
+        let min_idx = self
+            .ready_queue
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, t)| t.inner_exclusive_access().stride)
+            .map(|(i, _)| i)?;
+        let task = self.ready_queue.remove(min_idx)?;
+        // The task is about to consume one scheduling quantum, so charge it for
+        // it now: at `fetch` time (instead of at `suspend` time) because a task
+        // that gets woken up and then exits may never be suspended at all.
+        task.inner_exclusive_access().advance_stride();
+        Some(task)
     }
     pub fn remove(&mut self, task: Arc<TaskControlBlock>) {
         if let Some((id, _)) = self
@@ -73,6 +108,11 @@ pub fn wakeup_task(task: Arc<TaskControlBlock>) {
     trace!("kernel: TaskManager::wakeup_task");
     let mut task_inner = task.inner_exclusive_access();
     task_inner.task_status = TaskStatus::Ready;
+    // A blocked task was not charged for the time it spent waiting, so let it
+    // re-enter the queue at the current baseline: `TaskManager::add` raises it
+    // to the smallest stride already queued, which keeps the order between the
+    // already runnable tasks untouched.
+    task_inner.stride = 0;
     drop(task_inner);
     add_task(task);
 }

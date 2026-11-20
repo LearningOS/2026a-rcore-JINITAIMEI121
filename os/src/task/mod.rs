@@ -26,7 +26,7 @@ use crate::timer::remove_timer;
 use alloc::{sync::Arc, vec::Vec};
 use lazy_static::*;
 use manager::fetch_task;
-use process::ProcessControlBlock;
+pub use process::{ProcessControlBlock, MIN_MMAP_ADDR};
 use switch::__switch;
 
 pub use context::TaskContext;
@@ -37,7 +37,10 @@ pub use processor::{
     current_user_token, run_tasks, schedule, take_current_task,
 };
 pub use signal::SignalFlags;
-pub use task::{TaskControlBlock, TaskStatus};
+pub use task::{
+    TaskControlBlock, TaskControlBlockInner, TaskStatus, DEFAULT_PRIORITY, MAX_PRIORITY,
+    MIN_PRIORITY, STRIDE_1,
+};
 
 /// Make current task suspended and switch to the next task
 pub fn suspend_current_and_run_next() {
@@ -88,6 +91,13 @@ pub fn exit_current_and_run_next(exit_code: i32) {
     // it will be deallocated when sys_waittid is called
     drop(task_inner);
 
+    // A non-main thread that stops running must also leave the wait-for graph,
+    // otherwise a stale holder edge would make later probes report a cycle that
+    // no longer exists. The main thread is covered by `deallocate(pid)`.
+    if tid != 0 {
+        crate::sync::with_resource_manager(|rm| rm.cleanup_task(&task));
+    }
+
     // Move the task to stop-wait status, to avoid kernel stack from being freed
     if tid == 0 {
         add_stopping_task(task);
@@ -98,6 +108,10 @@ pub fn exit_current_and_run_next(exit_code: i32) {
     // the process should terminate at once
     if tid == 0 {
         let pid = process.getpid();
+        // Forget every wait-for edge of this process: its threads are gone, so
+        // leaving holder entries behind would make later deadlock probes report
+        // cycles that do not exist any more.
+        crate::sync::with_resource_manager(|rm| rm.deallocate(pid));
         if pid == IDLE_PID {
             println!(
                 "[kernel] Idle process exit with exit_code {} ...",

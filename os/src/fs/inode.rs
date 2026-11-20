@@ -1,11 +1,10 @@
 use super::File;
-use crate::drivers::BLOCK_DEVICE;
 use crate::mm::UserBuffer;
 use crate::sync::UPSafeCell;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use bitflags::*;
-use easy_fs::{EasyFileSystem, Inode};
+use easy_fs::Inode;
 use lazy_static::*;
 
 /// inode in memory
@@ -30,6 +29,10 @@ impl OSInode {
             inner: unsafe { UPSafeCell::new(OSInodeInner { offset: 0, inode }) },
         }
     }
+    /// The easy-fs inode behind this file descriptor.
+    pub fn inode(&self) -> Arc<Inode> {
+        self.inner.exclusive_access().inode.clone()
+    }
     /// read all data from the inode in memory
     pub fn read_all(&self) -> Vec<u8> {
         trace!("kernel: OSInode::read_all");
@@ -50,10 +53,7 @@ impl OSInode {
 }
 
 lazy_static! {
-    pub static ref ROOT_INODE: Arc<Inode> = {
-        let efs = EasyFileSystem::open(BLOCK_DEVICE.clone());
-        Arc::new(EasyFileSystem::root_inode(&efs))
-    };
+    pub static ref ROOT_INODE: Arc<Inode> = super::ROOT_DIR.clone();
 }
 
 /// List all apps in the root directory

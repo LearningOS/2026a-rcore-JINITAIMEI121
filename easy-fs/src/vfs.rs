@@ -169,6 +169,161 @@ impl Inode {
             v
         })
     }
+
+    /// Return the number of directory entries (i.e. hard links) of this inode.
+    pub fn nlink(&self) -> u32 {
+        let _fs = self.fs.lock();
+        self.read_disk_inode(|disk_inode| disk_inode.nlink as u32)
+    }
+
+    /// Is this inode a directory?
+    pub fn is_dir(&self) -> bool {
+        let _fs = self.fs.lock();
+        self.read_disk_inode(|disk_inode| disk_inode.is_dir())
+    }
+
+    /// The raw id of this inode inside the inode area.
+    pub fn id(&self) -> usize {
+        let fs = self.fs.lock();
+        fs.inode_id_of(self.block_id, self.block_offset)
+    }
+
+    /// Build an [`Inode`] handle for a raw inode id living in `fs`.
+    pub fn new_with_id(
+        fs: Arc<Mutex<EasyFileSystem>>,
+        block_device: Arc<dyn BlockDevice>,
+        inode_id: u32,
+    ) -> Arc<Self> {
+        let (block_id, block_offset) = fs.lock().get_disk_inode_pos(inode_id);
+        Arc::new(Self::new(block_id, block_offset, fs, block_device))
+    }
+
+    /// Return the inode id of the entry called `name` in this directory.
+    pub fn lookup_inode_id(&self, name: &str) -> Option<u32> {
+        let _fs = self.fs.lock();
+        self.read_disk_inode(|disk_inode| self.find_inode_id(name, disk_inode))
+    }
+
+    /// Add a new directory entry `name` in this directory pointing to an
+    /// existing inode whose id is `inode_id`. This is the backend of the
+    /// `linkat` syscall.
+    pub fn link(&self, name: &str, inode_id: u32) -> Option<u32> {
+        let mut fs = self.fs.lock();
+        if self.read_disk_inode(|disk_inode| self.find_inode_id(name, disk_inode)).is_some() {
+            return None;
+        }
+        // bump the nlink counter of the target inode
+        let (block_id, block_offset) = fs.get_disk_inode_pos(inode_id);
+        get_block_cache(block_id as usize, Arc::clone(&self.block_device))
+            .lock()
+            .modify(block_offset, |disk_inode: &mut DiskInode| {
+                disk_inode.nlink += 1;
+            });
+        self.modify_disk_inode(|root_inode| {
+            let file_count = (root_inode.size as usize) / DIRENT_SZ;
+            let new_size = (file_count + 1) as u32 * DIRENT_SZ as u32;
+            self.increase_size(new_size, root_inode, &mut fs);
+            let dirent = DirEntry::new(name, inode_id);
+            root_inode.write_at(
+                file_count * DIRENT_SZ,
+                dirent.as_bytes(),
+                &self.block_device,
+            );
+        });
+        block_cache_sync_all();
+        Some(inode_id)
+    }
+
+    /// Remove the directory entry `name` from this directory and decrease the
+    /// nlink counter of the inode it points to. When the counter reaches zero
+    /// the inode (and all its data blocks) are released. Backend of `unlinkat`.
+    pub fn unlink(&self, name: &str) -> bool {
+        let mut fs = self.fs.lock();
+        let inode_id =
+            match self.read_disk_inode(|disk_inode| self.find_inode_id(name, disk_inode)) {
+                Some(id) => id,
+                None => return false,
+            };
+        // drop the directory entry by shifting the following ones leftwards
+        let deleted = self.modify_disk_inode(|disk_inode| {
+            let file_count = (disk_inode.size as usize) / DIRENT_SZ;
+            if file_count == 0 {
+                return false;
+            }
+            // collect every entry except the one being removed
+            let mut entries: Vec<DirEntry> = Vec::new();
+            for i in 0..file_count {
+                let mut dirent = DirEntry::empty();
+                disk_inode.read_at(
+                    i * DIRENT_SZ,
+                    dirent.as_bytes_mut(),
+                    &self.block_device,
+                );
+                if dirent.name() != name {
+                    entries.push(dirent);
+                }
+            }
+            if entries.len() == file_count {
+                return false;
+            }
+            let new_size = entries.len() as u32 * DIRENT_SZ as u32;
+            // easy-fs can only grow an inode, so when the tail data block of the
+            // directory disappears we rebuild the whole directory. The root
+            // directory needs one block per 16 entries, so this is cheap.
+            let old_total_blocks = DiskInode::total_blocks(disk_inode.size);
+            let new_total_blocks = DiskInode::total_blocks(new_size);
+            if new_total_blocks < old_total_blocks {
+                let old_blocks = disk_inode.clear_size(&self.block_device);
+                for block in old_blocks.into_iter() {
+                    fs.dealloc_data(block);
+                }
+                let mut fresh: Vec<u32> = Vec::new();
+                for _ in 0..new_total_blocks {
+                    fresh.push(fs.alloc_data());
+                }
+                disk_inode.increase_size(new_size, fresh, &self.block_device);
+            } else {
+                // keep the already allocated blocks, just shorten the file
+                disk_inode.size = new_size;
+                for (i, dirent) in entries.iter().enumerate() {
+                    disk_inode.write_at(i * DIRENT_SZ, dirent.as_bytes(), &self.block_device);
+                }
+                return true;
+            }
+            for (i, dirent) in entries.iter().enumerate() {
+                disk_inode.write_at(i * DIRENT_SZ, dirent.as_bytes(), &self.block_device);
+            }
+            true
+        });
+        if !deleted {
+            return false;
+        }
+        // decrease the nlink of the target inode, release it if it is the last one
+        let (block_id, block_offset) = fs.get_disk_inode_pos(inode_id);
+        let should_free = get_block_cache(block_id as usize, Arc::clone(&self.block_device))
+            .lock()
+            .modify(block_offset, |disk_inode: &mut DiskInode| {
+                if disk_inode.nlink > 0 {
+                    disk_inode.nlink -= 1;
+                }
+                disk_inode.nlink == 0
+            });
+        if should_free {
+            get_block_cache(block_id as usize, Arc::clone(&self.block_device)).lock().modify(
+                block_offset,
+                |disk_inode: &mut DiskInode| {
+                    let size = disk_inode.size;
+                    let blocks = disk_inode.clear_size(&self.block_device);
+                    assert!(blocks.len() == DiskInode::total_blocks(size) as usize);
+                    for data_block in blocks.into_iter() {
+                        fs.dealloc_data(data_block);
+                    }
+                },
+            );
+        }
+        block_cache_sync_all();
+        true
+    }
     /// Read the content in offset position of the file into 'buf'
     pub fn read_at(&self, offset: usize, buf: &mut [u8]) -> usize {
         let _fs = self.fs.lock();

@@ -31,4 +31,5 @@ use block_cache::{block_cache_sync_all, get_block_cache};
 pub use block_dev::BlockDevice;
 pub use efs::EasyFileSystem;
 pub use layout::*;
+pub use spin::{Mutex, MutexGuard};
 pub use vfs::Inode;

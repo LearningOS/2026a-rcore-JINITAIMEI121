@@ -102,6 +102,12 @@ pub struct DiskInode {
     pub indirect2: u32,
     /// inode type
     type_: DiskInodeType,
+    /// number of hard links (directory entries) pointing to this inode.
+    ///
+    /// NOTE: `DiskInode` is 264 bytes long while the original layout only used
+    /// 256 bytes, so there are 8 unused bytes after `type_`. `nlink` lives in
+    /// the first of them and does not change the on-disk stride between inodes.
+    pub nlink: u16,
 }
 
 impl DiskInode {
@@ -112,6 +118,7 @@ impl DiskInode {
         self.indirect1 = 0;
         self.indirect2 = 0;
         self.type_ = type_;
+        self.nlink = 1;
     }
     /// inode is directory?
     pub fn is_dir(&self) -> bool {

@@ -6,7 +6,7 @@ use super::TaskControlBlock;
 use super::{add_task, SignalFlags};
 use super::{pid_alloc, PidHandle};
 use crate::fs::{File, Stdin, Stdout};
-use crate::mm::{translated_refmut, MemorySet, KERNEL_SPACE};
+use crate::mm::{translated_refmut, MemorySet, VirtAddr, KERNEL_SPACE};
 use crate::sync::{Condvar, Mutex, Semaphore, UPSafeCell};
 use crate::trap::{trap_handler, TrapContext};
 use alloc::string::String;
@@ -14,6 +14,11 @@ use alloc::sync::{Arc, Weak};
 use alloc::vec;
 use alloc::vec::Vec;
 use core::cell::RefMut;
+
+/// The lowest virtual address a process may hand out for `mmap`'ed anonymous
+/// memory. Below it lie the elf image and the data segment that `sys_sbrk`
+/// grows, so the kernel must never allocate there.
+pub const MIN_MMAP_ADDR: usize = 0x3b_0000;
 
 /// Process Control Block
 pub struct ProcessControlBlock {
@@ -81,6 +86,13 @@ impl ProcessControlBlockInner {
     /// get a task with tid in this process
     pub fn get_task(&self, tid: usize) -> Arc<TaskControlBlock> {
         self.tasks[tid].as_ref().unwrap().clone()
+    }
+    /// Find the lowest free virtual address range of `pages` pages at or above
+    /// `hint`. Backend of the anonymous `sys_mmap` when the caller did not give
+    /// an address hint. Delegates to the process' [`MemorySet`] so that thread
+    /// stacks and already mapped areas are taken into account.
+    pub fn find_free_va(&self, hint: usize, pages: usize) -> Option<VirtAddr> {
+        self.memory_set.find_free_va(hint, pages)
     }
 }
 
