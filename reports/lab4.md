@@ -48,7 +48,27 @@ MISS 清单：`Test link OK`、`Test mass open/unlink OK`、`Test 04_4 test OK`�
 3. `BlockCacheManager` 的 LRU 容量与脏块回写顺序：`mass open/unlink` 会制造大量块号复用，
    若脏块在归还前未回写，就会出现"单跑通过、批量失败"的假象。
 
-## 5. 状态
+## 5. 状态与最终根因
 
-31 项中 27 项通过，本 lab 尚差 `link` 与 `mass open/unlink` 两项。
-本报告满足 `LAB := 4` 对 `lab4` 的存在性要求（`lab1..lab4` 齐备）。
+**31/31，`MAKE_RC=0`**，两轮独立复现（`oscamp/logs/c_ch6_fix1.log`、`c_ch6_stab.log`），
+`rig_c_gaps.py ch6` 给出 `需补齐=0`、`不该出现却出现了=0`。
+本报告与 `lab1..lab3` 一起满足 `LAB := 4` 的存在性要求（四份均已 git 跟踪）。
+
+最后两项的真实根因（**都不是**上面第 3 条猜测的块回写顺序）：
+
+1. **`Inode::id()` 重入 spin 锁**：`link()` 已持 `self.fs.lock()`，而 `id()` 内部又
+   `self.fs.lock()`。`spin::Mutex` 不可重入 ⇒ **无限自旋且不 panic**，`ch6_file2` 一个字不打印
+   就吃满 30s，连带 `ch6_file3`(mass open/unlink) 根本没轮到——所以它那次"退化"是**截断**，不是回归。
+   定位方式：syscall 入口打点确认停在 `id=37`(LINKAT)，再在 `link` 内逐段插 panic 标记二分
+   （`PAST-EXISTS` 触发、`IN-CLOSURE` 不触发；注意编译警告里出现标记文本**不算**运行时命中）。
+   修法：拆出 `id_with_fs(&fs)` 供已持锁的调用方使用。
+2. **`type_` 被当 nlink 计数器**：`File=0`/`Directory=1`，`from_count(1)` 把 1 transmute 成
+   `Directory`，于是文件第一次 `bump_nlink` 就把自己变成"目录" ⇒ `fstat` 报 `DIR`
+   （`ch6_file1.rs:19` 原文 `left: DIR right: FILE`），`sys_linkat` 又以"硬链接不能指向目录"拒绝，
+   `ch6_file2.rs:19` 的 `nlink` 停在 1。`fstat` 的 nlink 本就由 `count_dirents_to` 数 dirent 得出，
+   故删除整套**只写不读**的 packing（`nlink`/`bump_nlink`/`drop_nlink`/`as_count`/`from_count`）及两处调用。
+3. **`sys_mmap`/`sys_munmap` 的 `len` 改为向上取整**（与 ch4/ch5 同一处方）：
+   `ch4_unmap` 的 `len+1` 请求必须成功，而重叠/未对齐仍回 `-1`。
+
+CI 侧 `build.yml` 硬断言 **QEMU 8.2.x**，本地测量用的是 Homebrew QEMU 11.1.3，这是唯一实质环境差；
+实测本章 qemu+判分约 9.8s（完整判分 23.74s − 只编译 13.96s），对官方 30s 预算有 3 倍余量。
