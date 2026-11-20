@@ -154,24 +154,6 @@ impl PageTable {
     pub fn translate(&self, vpn: VirtPageNum) -> Option<PageTableEntry> {
         self.find_pte(vpn).map(|pte| *pte)
     }
-    /// The leaf page table entry of an already mapped page, `None` when any
-    /// level of the walk is missing. Used to rewrite the flags of an existing
-    /// mapping without allocating anything (`sys_mmap` widening permissions).
-    pub fn find_existing_pte(&mut self, vpn: VirtPageNum) -> Option<&mut PageTableEntry> {
-        let idxs = vpn.indexes();
-        let mut ppn = self.root_ppn;
-        for (i, idx) in idxs.iter().enumerate() {
-            let pte = &mut ppn.get_pte_array()[*idx];
-            if i == 2 {
-                return if pte.is_valid() { Some(pte) } else { None };
-            }
-            if !pte.is_valid() {
-                return None;
-            }
-            ppn = pte.ppn();
-        }
-        None
-    }
     /// get the physical address from the virtual address
     pub fn translate_va(&self, va: VirtAddr) -> Option<PhysAddr> {
         self.find_pte(va.clone().floor()).map(|pte| {
@@ -256,7 +238,13 @@ pub fn copied_byte_buffer(token: usize, ptr: *const u8, len: usize) -> Option<Ve
     let end = start.checked_add(len)?;
     while start < end {
         let start_va = VirtAddr::from(start);
-        let ppn = page_table.translate(start_va.floor())?.ppn();
+        // An empty leaf PTE still translates to `Some`, and its ppn is 0 —
+        // reading it would hand kernel memory back as user data.
+        let pte = page_table.translate(start_va.floor())?;
+        if !pte.is_valid() {
+            return None;
+        }
+        let ppn = pte.ppn();
         let chunk_len = core::cmp::min(end - start, PAGE_SIZE - start_va.page_offset());
         buf.extend_from_slice(
             &ppn.get_bytes_array()[start_va.page_offset()..start_va.page_offset() + chunk_len],

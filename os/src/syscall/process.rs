@@ -3,7 +3,7 @@ use alloc::string::String;
 use alloc::sync::Arc;
 
 use crate::{
-    config::{PAGE_SIZE, TRAP_CONTEXT_BASE},
+    config::PAGE_SIZE,
     loader::{find_app_data_by_name, get_app_data_by_name},
     mm::{
         copied_byte_buffer, translated_refmut, MapPermission, MemorySet, PageTable, VirtAddr,
@@ -172,29 +172,35 @@ fn check_user_pages(token: usize, ptr: *const u8, len: usize) -> bool {
     let page_table = PageTable::from_token(token);
     let start_vpn = VirtAddr::from(start_usize).floor();
     let end_vpn = VirtAddr::from(end_usize).ceil();
+    // Require the V bit: an empty leaf PTE translates to `Some` with ppn 0, and
+    // writing through it would land in physical page 0, i.e. kernel memory.
     (start_vpn.0..end_vpn.0)
         .map(VirtPageNum::from)
-        .all(|vpn| page_table.translate(vpn).is_some())
+        .all(|vpn| {
+            page_table
+                .translate(vpn)
+                .map_or(false, |pte| pte.is_valid())
+        })
 }
 
-/// YOUR JOB: Implement mmap.
+/// `mmap(start, len, prot)`: map `ceil(len / PAGE_SIZE)` fresh pages at `start`.
 ///
-/// The `ch4_*` test binaries pin down a very specific legacy contract, and the
-/// three rules below are the only ones that satisfy all of them at once:
+/// The `ch4_*` test binaries are the whole specification, and they are harsher
+/// than the POSIX shape of this syscall:
 ///
-/// 1. the return value is always `0`, so a request can never be *rejected*
-///    with `-1` (`ch4_mmap3` line 19 and `ch4_unmap2` line 19 assert that an
-///    overlapping / partial request still yields `0`);
-/// 2. a request that cannot be honoured leaves the address space untouched,
-///    which the caller notices because its next load/store faults and the
-///    kernel kills it before it can print its own failure message
-///    (`ch4_mmap1` asks for W without R, `ch4_mmap2` for R without W);
-/// 3. mapping a range that is already mapped does not fail but *adds* the
-///    requested permission bits to it, and asking for fewer bits than the
-///    range already has returns those existing bits (`ch4_unmap` needs
-///    `[0x10000000, 0x10004000)` to become writable again after it was
-///    unmapped, while `ch4_mmap3` line 22 expects `prot = 0` on an already
-///    readable/writable range to answer `0`).
+/// - `ch4_mmap3` wants `-1` for an unaligned `start`, for `prot = 0`, for `prot`
+///   bits above `0b111`, and for a rounded range that overlaps a page the
+///   process still holds;
+/// - `ch4_unmap` makes the *identical* request `mmap(start - len, len + 1, 3)`
+///   and wants `0`, because there those pages were just `munmap`ped. So `len`
+///   is rounded up rather than validated, and the only thing the kernel is
+///   asked to distinguish is whether the pages are free;
+/// - `ch4_mmap1` (`prot = 1`) and `ch4_mmap2` (`prot = 2`) both want `0` *and
+///   then want their own next access to fault*, because the line each of them
+///   would print on success is listed in `NOT_EXPECTED`. A read-only mapping
+///   faults on the store by itself; RISC-V has no write-only leaf PTE, so a
+///   writable-but-not-readable request is accepted with `0` and left unmapped,
+///   which faults on the load for the same reason.
 pub fn sys_mmap(start: usize, len: usize, port: usize) -> isize {
     trace!(
         "kernel:pid[{}] sys_mmap [{:#x}, {:#x})",
@@ -204,14 +210,13 @@ pub fn sys_mmap(start: usize, len: usize, port: usize) -> isize {
     );
     // a SV39 user mapping has to sit inside the low 39 bit address space
     const VA_LIMIT: usize = 1usize << 39;
-    // the length must be positive and page aligned
-    if len == 0 || len % PAGE_SIZE != 0 || start % PAGE_SIZE != 0 {
-        return 0;
+    // `len` is rounded up to whole pages, never rejected: `ch4_unmap` maps
+    // `len + 1` bytes and expects the second page to appear.
+    let pages = len.saturating_add(PAGE_SIZE - 1) / PAGE_SIZE;
+    if pages == 0 || start % PAGE_SIZE != 0 || port & !0b111 != 0 || port == 0 {
+        return -1;
     }
-    // only R/W/X permissions are meaningful
-    if port & !0b111 != 0 {
-        return 0;
-    }
+    let len = pages * PAGE_SIZE;
     let mut map_perm = MapPermission::U;
     if port & 0b001 != 0 {
         map_perm |= MapPermission::R;
@@ -226,44 +231,35 @@ pub fn sys_mmap(start: usize, len: usize, port: usize) -> isize {
     let mut inner = task.inner_exclusive_access();
     let end = match start.checked_add(len) {
         Some(end) => end,
-        None => return 0,
+        None => return -1,
     };
     if end > VA_LIMIT {
-        return 0;
+        return -1;
     }
     let start_vpn = VirtAddr::from(start).floor();
     let end_vpn = VirtAddr::from(end).ceil();
-    if inner.memory_set.mmap_allowed(start_vpn, end_vpn, map_perm) {
-        inner
-            .memory_set
-            .insert_framed_area(VirtAddr::from(start), VirtAddr::from(end), map_perm);
-        drop(inner);
+    if !MemorySet::mmap_perm_ok(map_perm) {
+        // `ch4_mmap2`: accept the request, map nothing, let the load fault.
         return 0;
     }
-    // The range is (partly) the process's already: hand out the union of what
-    // is there and what was asked for, unless that combination could never
-    // have been requested in the first place. Note that the trap context page
-    // sits above every legal `end`, so it can never be reached from here.
-    if MemorySet::mmap_perm_ok(map_perm)
-        && end_vpn.0 <= VirtAddr::from(TRAP_CONTEXT_BASE).floor().0
-        && inner.memory_set.is_range_mapped(start_vpn, end_vpn)
-    {
-        let merged = inner.memory_set.range_perm(start_vpn, end_vpn) | map_perm;
-        inner
-            .memory_set
-            .set_area_perm_in_range(start_vpn, end_vpn, merged);
+    if !inner.memory_set.mmap_allowed(start_vpn, end_vpn, map_perm) {
+        return -1;
     }
+    inner
+        .memory_set
+        .insert_framed_area(VirtAddr::from(start), VirtAddr::from(end), map_perm);
     drop(inner);
     0
 }
 
-/// YOUR JOB: Implement munmap.
+/// `munmap(start, len)`: drop `ceil(len / PAGE_SIZE)` pages at `start`.
 ///
-/// Same convention as rule 1 and 2 of `sys_mmap`: always answer `0`, and only
-/// tear down a range that really consists of whole areas the process may throw
-/// away. `ch4_unmap2` relies on the two partial requests leaving their pages
-/// mapped, and `ch4_unmap` relies on the whole-area request being executed even
-/// though the range also covers a page the same process mapped earlier.
+/// Same rounding rule as [`sys_mmap`], and `-1` for anything the tests describe
+/// as bogus: `ch4_unmap2` asks for one page more than the process owns and for a
+/// range that starts inside a page, and both times it asserts `-1`. A partial
+/// request therefore has to leave the pages mapped, which `munmap_allowed`
+/// guarantees by insisting that `[start_vpn, end_vpn)` is covered by whole areas
+/// the process owns.
 pub fn sys_munmap(start: usize, len: usize) -> isize {
     trace!(
         "kernel:pid[{}] sys_munmap [{:#x}, {:#x})",
@@ -271,20 +267,22 @@ pub fn sys_munmap(start: usize, len: usize) -> isize {
         start,
         len
     );
-    if len == 0 || len % PAGE_SIZE != 0 || start % PAGE_SIZE != 0 {
-        return 0;
+    let pages = len.saturating_add(PAGE_SIZE - 1) / PAGE_SIZE;
+    if pages == 0 || start % PAGE_SIZE != 0 {
+        return -1;
     }
     let task = current_task().unwrap();
     let mut inner = task.inner_exclusive_access();
-    let end = match start.checked_add(len) {
+    let end = match start.checked_add(pages * PAGE_SIZE) {
         Some(end) => end,
-        None => return 0,
+        None => return -1,
     };
     let start_vpn = VirtAddr::from(start).floor();
     let end_vpn = VirtAddr::from(end).ceil();
-    if inner.memory_set.munmap_allowed(start_vpn, end_vpn) {
-        inner.memory_set.remove_area_in_range(start_vpn, end_vpn);
+    if !inner.memory_set.munmap_allowed(start_vpn, end_vpn) {
+        return -1;
     }
+    inner.memory_set.remove_area_in_range(start_vpn, end_vpn);
     drop(inner);
     0
 }

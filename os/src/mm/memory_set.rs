@@ -279,10 +279,20 @@ impl MemorySet {
     /// Whether every page of `[start_vpn, end_vpn)` is currently unmapped.
     /// `sys_mmap` uses it so that it never overwrites pages already owned by
     /// another `MapArea` (the elf sections, the user stack, the trap context).
+    ///
+    /// The test is the V bit, not `translate(..).is_some()`: mapping one page
+    /// allocates the intermediate table for its whole 2MB region, after which
+    /// every *other* page in that region still yields `Some(pte)` — an empty
+    /// one. Judging by existence would reject `mmap(start + len, len * 2)`
+    /// right after `mmap(start, len)` succeeded (`ch4_unmap` line 19).
     pub fn is_range_free(&self, start_vpn: VirtPageNum, end_vpn: VirtPageNum) -> bool {
         (start_vpn.0..end_vpn.0)
             .map(VirtPageNum::from)
-            .all(|vpn| self.page_table.translate(vpn).is_none())
+            .all(|vpn| {
+                self.page_table
+                    .translate(vpn)
+                    .map_or(true, |pte| !pte.is_valid())
+            })
     }
 
     /// The permissions a `sys_mmap` request may have at all, independent of
@@ -315,36 +325,17 @@ impl MemorySet {
         Self::mmap_perm_ok(perm) && self.is_range_free(start_vpn, end_vpn)
     }
 
-    /// The permissions the process really has on `[start_vpn, end_vpn)`, i.e.
-    /// the union of the flags of the mapped pages. `sys_mmap` reports them for
-    /// a range it refuses to map again, so that a caller asking for *less* than
-    /// what is already there still sees its own permission bits come back.
-    pub fn range_perm(&self, start_vpn: VirtPageNum, end_vpn: VirtPageNum) -> MapPermission {
-        let mut perm = MapPermission::empty();
-        for vpn in VPNRange::new(start_vpn, end_vpn) {
-            if let Some(pte) = self.page_table.translate(vpn) {
-                let pte_flags = pte.flags();
-                if pte_flags.contains(PTEFlags::R) {
-                    perm |= MapPermission::R;
-                }
-                if pte_flags.contains(PTEFlags::W) {
-                    perm |= MapPermission::W;
-                }
-                if pte_flags.contains(PTEFlags::X) {
-                    perm |= MapPermission::X;
-                }
-            }
-        }
-        perm
-    }
-
     /// Whether every page of `[start_vpn, end_vpn)` is currently mapped.
     /// `sys_munmap` uses it so that it never tears down pages the process
     /// still needs (the elf sections, the user stack, the trap context).
     pub fn is_range_mapped(&self, start_vpn: VirtPageNum, end_vpn: VirtPageNum) -> bool {
         (start_vpn.0..end_vpn.0)
             .map(VirtPageNum::from)
-            .all(|vpn| self.page_table.translate(vpn).is_some())
+            .all(|vpn| {
+                self.page_table
+                    .translate(vpn)
+                    .map_or(false, |pte| pte.is_valid())
+            })
     }
 
     /// Whether `[start_vpn, end_vpn)` covers a whole set of `MapArea`s, none
@@ -374,30 +365,6 @@ impl MemorySet {
             }
         }
         covered == end_vpn.0 - start_vpn.0
-    }
-
-    /// Rewrite the permission bits of every mapped page in `[start_vpn, end_vpn)`.
-    /// This is how `sys_mmap` "adds" permissions to a range it refuses to map
-    /// again: the physical pages (and therefore the data already written to
-    /// them) stay exactly where they are, only the leaf PTE flags change.
-    pub fn set_area_perm_in_range(
-        &mut self,
-        start_vpn: VirtPageNum,
-        end_vpn: VirtPageNum,
-        perm: MapPermission,
-    ) {
-        for area in self.areas.iter_mut() {
-            let (area_start, area_end) = (area.vpn_range.get_start().0, area.vpn_range.get_end().0);
-            if area_start >= end_vpn.0 || area_end <= start_vpn.0 {
-                continue;
-            }
-            // never rewrite a kernel-owned area (trampoline / trap context):
-            // it must stay non-user and readable for `trap_return` to work
-            if area.is_kernel_page_table() {
-                continue;
-            }
-            area.set_perm(&mut self.page_table, perm);
-        }
     }
 
     /// Unmap and drop every `MapArea` fully contained in `[start_vpn, end_vpn)`.
@@ -506,18 +473,6 @@ impl MapArea {
     /// must never tear such an area down.
     pub fn is_kernel_page_table(&self) -> bool {
         !self.map_perm.contains(MapPermission::U)
-    }
-    /// Change the flags of this area and refresh every leaf PTE it owns, so
-    /// that `sys_mmap` can widen the permissions of an already mapped range
-    /// without touching the physical frames behind it.
-    pub fn set_perm(&mut self, page_table: &mut PageTable, perm: MapPermission) {
-        self.map_perm = perm;
-        let pte_flags = PTEFlags::from_bits(perm.bits).unwrap();
-        for vpn in self.vpn_range {
-            if let Some(pte) = page_table.find_existing_pte(vpn) {
-                *pte = PageTableEntry::new(pte.ppn(), pte_flags);
-            }
-        }
     }
     pub fn map_one(&mut self, page_table: &mut PageTable, vpn: VirtPageNum) {
         let ppn: PhysPageNum;
